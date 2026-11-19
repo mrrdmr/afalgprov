@@ -25,8 +25,6 @@ ARM Cortex-A9 processors lack hardware AES cryptographic instructions (ARMv8 Cry
 
 * **Block-Size Threshold (`8192` bytes) and Chunking (`65536` bytes):**
   Invoking an `AF_ALG` socket incurs system call overhead (`sendmsg` / `read`), user-kernel memory copies, and hardware interrupt handling on IRQ 45 (`9b000000.crypto`). For chunks smaller than 8 KB, the module delegates operations to an internal software context (`sw_ctx` from `default`). Starting at 8 KB, it switches to SPACC DMA, splitting large buffers into 64 KB chunks (`MAX_HW_CHUNK`) to stay within kernel socket buffer limits.
-* **16-Byte Alignment for `AES-CTR`:**
-  The `ctr-aes-ls1024a-spacc` kernel driver and hardware DMA maintain only the 16-byte counter between calls and do not cache unused keystream bytes. For buffers `? 8192` bytes, the aligned portion (`len & ~15`) is sent to SPACC DMA, while the trailing remainder (`1–15` bytes) is processed by `sw_ctx` while preserving intra-block offset state (`sw_unaligned`).
 * **In-Place Safety (`out == in`) and IV Synchronization (`iv_dirty`):**
   During `AES-CBC` decryption, the next 16-byte IV is saved from the input ciphertext before the buffer is overwritten. The `iv_dirty` flag synchronizes the IV back to the software context only when transitioning from DMA to `sw_ctx` or when finalizing PKCS#7 padding (`afalg_final` for TLS 1.3 Session Tickets).
 * **Lazy Kernel Descriptor Initialization:**
