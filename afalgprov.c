@@ -49,10 +49,12 @@ typedef struct {
     const AFALG_CIPHER_INFO *info;
     OSSL_LIB_CTX *libctx;
 
-    /* Kernel descriptors */
+    /* Kernel descriptors and reusable control buffer */
     int tfmfd;
     int opfd;
     int pipe_fds[2];        /* Pre-created pipe for vmsplice/splice */
+    char *cbuf;             /* Pre-allocated CMSG control buffer for sendmsg() */
+    size_t cbuf_len;
 
     /* Cryptographic state */
     uint8_t key[MAX_KEY_LEN];
@@ -219,14 +221,13 @@ static void afalg_reset_hw_descriptors(AFALG_CTX *ctx)
 
 /*
  * Transfer through vmsplice(..., 0) + splice(), handling partial operations,
- * EINTR, a dynamic CMSG buffer, and reporting actually processed bytes (*done).
+ * EINTR, pre-allocated CMSG buffer, and reporting actually processed bytes (*done).
  */
 static int afalg_hw_zero_copy(AFALG_CTX *ctx, const uint8_t *in, uint8_t *out,
                               size_t len, size_t *done)
 {
     int ret = 0;
-    char *cbuf = NULL;
-    size_t cbuf_len = 0;
+    size_t req_cbuf = 0;
     size_t processed = 0;
 
     *done = 0;
@@ -234,20 +235,21 @@ static int afalg_hw_zero_copy(AFALG_CTX *ctx, const uint8_t *in, uint8_t *out,
     if (!afalg_init_hw(ctx))
         return 0;
 
-    cbuf_len = CMSG_SPACE(sizeof(uint32_t));
+    req_cbuf = CMSG_SPACE(sizeof(uint32_t));
     if (ctx->ivlen > 0) {
-        cbuf_len += CMSG_SPACE(sizeof(struct af_alg_iv) + ctx->ivlen);
+        req_cbuf += CMSG_SPACE(sizeof(struct af_alg_iv) + ctx->ivlen);
     }
 
-    cbuf = OPENSSL_zalloc(cbuf_len);
-    if (cbuf == NULL)
+    if (ctx->cbuf == NULL || req_cbuf > ctx->cbuf_len)
         return 0;
+
+    memset(ctx->cbuf, 0, req_cbuf);
 
     struct msghdr msg = {0};
     struct cmsghdr *cmsg;
 
-    msg.msg_control = cbuf;
-    msg.msg_controllen = cbuf_len;
+    msg.msg_control = ctx->cbuf;
+    msg.msg_controllen = req_cbuf;
 
     cmsg = CMSG_FIRSTHDR(&msg);
     cmsg->cmsg_level = SOL_ALG;
@@ -348,10 +350,6 @@ static int afalg_hw_zero_copy(AFALG_CTX *ctx, const uint8_t *in, uint8_t *out,
 
 cleanup:
     *done = processed;
-    if (cbuf != NULL) {
-        OPENSSL_cleanse(cbuf, cbuf_len);
-        OPENSSL_free(cbuf);
-    }
     return ret;
 }
 
@@ -359,19 +357,25 @@ cleanup:
  * OpenSSL provider context lifecycle
  * ========================================================================= */
 
-typedef struct {
-    OSSL_LIB_CTX *libctx;
-    OSSL_PROVIDER *default_prov;
-} AFALG_PROV_CTX;
-
 static void *afalg_newctx(void *provctx, const AFALG_CIPHER_INFO *info)
 {
     AFALG_CTX *ctx = OPENSSL_zalloc(sizeof(*ctx));
     if (ctx == NULL)
         return NULL;
 
+    ctx->cbuf_len = CMSG_SPACE(sizeof(uint32_t));
+    if (info->ivlen > 0) {
+        ctx->cbuf_len += CMSG_SPACE(sizeof(struct af_alg_iv) + info->ivlen);
+    }
+
+    ctx->cbuf = OPENSSL_zalloc(ctx->cbuf_len);
+    if (ctx->cbuf == NULL) {
+        OPENSSL_free(ctx);
+        return NULL;
+    }
+
     ctx->info            = info;
-    ctx->libctx          = ((AFALG_PROV_CTX *)provctx)->libctx;
+    ctx->libctx          = (OSSL_LIB_CTX *)provctx;
     ctx->tfmfd           = -1;
     ctx->opfd            = -1;
     ctx->pipe_fds[0]     = -1;
@@ -397,6 +401,11 @@ static void afalg_freectx(void *vctx)
     EVP_CIPHER_CTX_free(ctx->sw_ctx);
     EVP_CIPHER_free(ctx->sw_cipher);
 
+    if (ctx->cbuf != NULL) {
+        OPENSSL_cleanse(ctx->cbuf, ctx->cbuf_len);
+        OPENSSL_free(ctx->cbuf);
+    }
+
     OPENSSL_cleanse(ctx->key, sizeof(ctx->key));
     OPENSSL_cleanse(ctx->iv, sizeof(ctx->iv));
     OPENSSL_free(ctx);
@@ -419,8 +428,17 @@ static void *afalg_dupctx(void *vctx)
     dst->pipe_fds[0] = -1;
     dst->pipe_fds[1] = -1;
     dst->hw_key_set  = 0;
+    dst->cbuf        = NULL;
     dst->sw_cipher   = NULL;
     dst->sw_ctx      = NULL;
+
+    if (dst->cbuf_len > 0) {
+        dst->cbuf = OPENSSL_zalloc(dst->cbuf_len);
+        if (dst->cbuf == NULL) {
+            afalg_freectx(dst);
+            return NULL;
+        }
+    }
 
     if (src->sw_ctx != NULL) {
         dst->sw_ctx = EVP_CIPHER_CTX_dup(src->sw_ctx);
@@ -529,7 +547,7 @@ static int afalg_update(void *vctx, unsigned char *out, size_t *outl, size_t out
 
     /*
      * 1. A stream that already went to SW on an unaligned piece stays in SW.
-     * 2. CBC DECRYPT with padding runs entirely in SW: EVP buffers the 
+     * 2. CBC DECRYPT with padding runs entirely in SW: EVP buffers the
      *    last block internally, which is incompatible with HW zero-copy.
      * 3. CBC ENCRYPT with padding uses HW safely for full blocks.
      */
@@ -554,6 +572,9 @@ static int afalg_update(void *vctx, unsigned char *out, size_t *outl, size_t out
             if (hw_written > 0) {
                 if (!afalg_ensure_sw(ctx))
                     return 0;
+                if (!EVP_CipherInit_ex(ctx->sw_ctx, NULL, NULL, NULL, ctx->iv, -1))
+                    return 0;
+                ctx->iv_dirty = 0;
             }
         }
     }
@@ -814,16 +835,15 @@ static const OSSL_ALGORITHM *afalg_query(void *provctx, int operation_id, int *n
     return NULL;
 }
 
+static OSSL_PROVIDER *afalg_default_prov;
+
 static void afalg_teardown(void *provctx)
 {
-    AFALG_PROV_CTX *pctx = (AFALG_PROV_CTX *)provctx;
-
-    if (pctx == NULL)
-        return;
-    if (pctx->default_prov != NULL)
-        OSSL_PROVIDER_unload(pctx->default_prov);
-    OSSL_LIB_CTX_free(pctx->libctx);
-    OPENSSL_free(pctx);
+    if (afalg_default_prov != NULL) {
+        OSSL_PROVIDER_unload(afalg_default_prov);
+        afalg_default_prov = NULL;
+    }
+    OSSL_LIB_CTX_free((OSSL_LIB_CTX *)provctx);
 }
 
 static const OSSL_DISPATCH afalg_dispatch_table[] = {
@@ -834,30 +854,21 @@ static const OSSL_DISPATCH afalg_dispatch_table[] = {
     { 0, NULL }
 };
 
-
 int OSSL_provider_init(const OSSL_CORE_HANDLE *handle, const OSSL_DISPATCH *in,
                        const OSSL_DISPATCH **out, void **provctx)
 {
-    AFALG_PROV_CTX *pctx = OPENSSL_zalloc(sizeof(*pctx));
-
-    if (pctx == NULL)
+    OSSL_LIB_CTX *libctx = OSSL_LIB_CTX_new_from_dispatch(handle, in);
+    if (libctx == NULL)
         return 0;
-
-    pctx->libctx = OSSL_LIB_CTX_new_from_dispatch(handle, in);
-    if (pctx->libctx == NULL) {
-        OPENSSL_free(pctx);
-        return 0;
-    }
 
     /* default is needed by the SW fallback; keep the ref until teardown */
-    pctx->default_prov = OSSL_PROVIDER_load(pctx->libctx, "default");
-    if (pctx->default_prov == NULL) {
-        OSSL_LIB_CTX_free(pctx->libctx);
-        OPENSSL_free(pctx);
+    afalg_default_prov = OSSL_PROVIDER_load(libctx, "default");
+    if (afalg_default_prov == NULL) {
+        OSSL_LIB_CTX_free(libctx);
         return 0;
     }
 
-    *provctx = pctx;
+    *provctx = libctx;
     *out = afalg_dispatch_table;
     return 1;
 }
