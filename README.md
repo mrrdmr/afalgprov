@@ -63,7 +63,8 @@ Measured throughput and CPU utilization on the **NXP LS1024A** board (OpenSSL 3.
    Combining `afalgprov` for streaming `AES-CTR` / `AES-CBC` with `ChaCha20-Poly1305` priority for TLS 1.3 (**61.2 MB/s** vs. **12.9 MB/s** for `AES-128-GCM`) maximizes throughput across all workloads on NXP LS1024A.
 
 ### Reproducing Benchmarks (`OPENSSL_CONF=/dev/null` vs. `afalgprov`)
-```bash
+
+~~~bash
 echo "=== 0. IRQ BASELINE ===" && \
 grep crypto /proc/interrupts && \
 echo "=== 1. PURE CPU (OPENSSL_CONF=/dev/null, default only) ===" && \
@@ -79,3 +80,109 @@ grep crypto /proc/interrupts && \
 echo "=== 3. CPU AEAD: ChaCha20-Poly1305 vs AES-128-GCM ===" && \
 OPENSSL_CONF=/dev/null openssl speed -elapsed -provider default -evp chacha20-poly1305 -bytes 65536 2>&1 | grep -E "Doing|ChaCha20" && \
 OPENSSL_CONF=/dev/null openssl speed -elapsed -provider default -evp aes-128-gcm -bytes 65536 2>&1 | grep -E "Doing|AES-"
+~~~
+
+---
+
+## 2. System Preparation and Dependencies
+
+### 2.1. Install Build Packages
+
+~~~bash
+sudo apt-get update
+sudo apt-get install -y build-essential libssl-dev
+~~~
+
+### 2.2. Verify Hardware Crypto Engine and Kernel Modules
+
+~~~bash
+grep crypto /proc/interrupts
+grep -B 1 -A 14 -E "name\s*:\s*(cbc|ctr)\(aes\)" /proc/crypto
+lsmod | grep -E "af_alg|algif_skcipher|ls1024a_spacc"
+~~~
+
+*(Expected kernel drivers: `ctr-aes-ls1024a-spacc` and `cbc-aes-ls1024a-spacc` with `priority : 300`, `min keysize : 16`, `max keysize : 32`.)*
+
+---
+
+## 3. Compile and Install into `ossl-modules`
+
+~~~bash
+sudo make clean all
+sudo make install
+~~~
+
+### 3.1. Verify the Installed Shared Library and Backup Configuration
+
+~~~bash
+ls -l /usr/lib/arm-linux-gnueabihf/ossl-modules/afalgprov.so
+ldd /usr/lib/arm-linux-gnueabihf/ossl-modules/afalgprov.so
+sudo cp -a /etc/ssl/openssl.cnf /etc/ssl/openssl.cnf.bak
+~~~
+
+### 3.2. Global `/etc/ssl/openssl.cnf` Configuration
+
+Ensure `openssl_conf = openssl_init` is defined at the top level of `/etc/ssl/openssl.cnf` (before any `[section]` headers):
+
+~~~ini
+openssl_conf = openssl_init
+
+[openssl_init]
+providers = provider_sect
+alg_section = evp_properties
+
+[provider_sect]
+default = default_sect
+afalgprov = afalgprov_sect
+
+[default_sect]
+activate = 1
+
+[afalgprov_sect]
+module = /usr/lib/arm-linux-gnueabihf/ossl-modules/afalgprov.so
+activate = 1
+
+[evp_properties]
+default_properties = ?provider=afalgprov
+~~~
+
+### 3.3. Per-Service Isolation (Optional)
+
+To enable SPACC offloading only for specific services (e.g., OpenVPN, `stunnel`, or custom daemons) without modifying `/etc/ssl/openssl.cnf`, save the configuration above to `/etc/ssl/openssl-spacc.cnf` and pass `OPENSSL_CONF=/etc/ssl/openssl-spacc.cnf` (or `Environment="OPENSSL_CONF=/etc/ssl/openssl-spacc.cnf"` inside the systemd unit). Sandboxed services with `SystemCallFilter` must allow `socket`, `bind`, `accept4`, `pipe2`, `vmsplice`, and `splice`.
+
+---
+
+## 4. Restart Services, Verification and Diagnostics
+
+~~~bash
+sudo systemctl restart ssh
+openssl list -providers
+openssl list -cipher-algorithms -provider afalgprov | grep "@ afalgprov"
+openssl ciphers -v -tls1_3
+~~~
+
+### End-to-End Byte-Exactness Check (`AES-128 / 192 / 256`)
+
+~~~bash
+dd if=/dev/urandom bs=65536 count=4 of=/tmp/test_in.bin status=none && \
+for bits in 128 192 256; do
+  KEY=$(head -c $((bits / 8)) /dev/urandom | od -An -tx1 | tr -d ' \n')
+  IV="00112233445566778899aabbccddeeff"
+  for mode in ctr cbc; do
+    openssl enc -aes-${bits}-${mode} -bufsize 65536 -provider afalgprov -K "$KEY" -iv "$IV" -in /tmp/test_in.bin -out /tmp/test_enc.bin && \
+    openssl enc -d -aes-${bits}-${mode} -bufsize 65536 -provider default -K "$KEY" -iv "$IV" -in /tmp/test_enc.bin -out /tmp/test_dec.bin && \
+    cmp -s /tmp/test_in.bin /tmp/test_dec.bin && echo "AES-${bits}-${mode^^}: OK" || echo "AES-${bits}-${mode^^}: FAIL"
+  done
+done && \
+rm -f /tmp/test_in.bin /tmp/test_enc.bin /tmp/test_dec.bin
+~~~
+
+---
+
+## 5. Reverting Changes (Uninstall)
+
+~~~bash
+sudo cp -a /etc/ssl/openssl.cnf.bak /etc/ssl/openssl.cnf
+sudo make -C /data/shared/afalgprov uninstall
+sudo systemctl restart ssh
+~~~
