@@ -114,11 +114,16 @@ sudo make install
 
 ### 3.1. Verify the Installed Shared Library and Backup Configuration
 
+Before editing `/etc/ssl/openssl.cnf`, create a backup copy (preserving permissions and timestamps). A malformed `openssl.cnf` can prevent `openssl`, `ssh`, `apt`, and `curl` from initializing TLS/crypto:
+
 ~~~bash
 ls -l /usr/lib/arm-linux-gnueabihf/ossl-modules/afalgprov.so
 ldd /usr/lib/arm-linux-gnueabihf/ossl-modules/afalgprov.so
-sudo cp -a /etc/ssl/openssl.cnf /etc/ssl/openssl.cnf.bak
+sudo cp -an /etc/ssl/openssl.cnf /etc/ssl/openssl.cnf.bak
+ls -l /etc/ssl/openssl.cnf /etc/ssl/openssl.cnf.bak
 ~~~
+
+*(Using `cp -an` ensures an existing original backup `/etc/ssl/openssl.cnf.bak` is never overwritten on subsequent updates. If you ever need to test a modified configuration safely before replacing the system file, validate it first via `OPENSSL_CONF=/tmp/openssl.cnf.test openssl list -providers`.)*
 
 ### 3.2. Global `/etc/ssl/openssl.cnf` Configuration
 
@@ -181,8 +186,11 @@ rm -f /tmp/test_in.bin /tmp/test_enc.bin /tmp/test_dec.bin
 
 ## 5. Reverting Changes (Uninstall)
 
+Restore the original `/etc/ssl/openssl.cnf` from `/etc/ssl/openssl.cnf.bak`, remove the installed provider module, and restart dependent services:
+
 ~~~bash
 sudo cp -a /etc/ssl/openssl.cnf.bak /etc/ssl/openssl.cnf
 sudo make -C /data/shared/afalgprov uninstall
 sudo systemctl restart ssh
+openssl list -providers
 ~~~
