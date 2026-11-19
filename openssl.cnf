@@ -1,0 +1,84 @@
+#
+# OpenSSL 3.5 configuration for NXP LS1024A (SPACC DMA + NEON ChaCha20)
+#
+
+openssl_conf = openssl_init
+
+HOME            = .
+oid_section     = new_oids
+
+[ new_oids ]
+tsa_policy1 = 1.2.3.4.1
+tsa_policy2 = 1.2.3.4.5.6
+tsa_policy3 = 1.2.3.4.5.7
+
+# =====================================================================
+# Provider initialization, default properties, and TLS profiles
+# =====================================================================
+[ openssl_init ]
+providers   = provider_sect
+alg_section = evp_properties
+ssl_conf    = ssl_sect
+
+[ evp_properties ]
+# Soft preference (?): prefer afalgprov for AES-CTR/CBC,
+# fall back to default for everything else (AEAD, digests, asymmetric).
+default_properties = ?provider=afalgprov
+
+[ provider_sect ]
+default   = default_sect
+afalgprov = afalgprov_sect
+
+[ default_sect ]
+activate = 1
+
+[ afalgprov_sect ]
+module   = /usr/lib/arm-linux-gnueabihf/ossl-modules/afalgprov.so
+activate = 1
+
+# =====================================================================
+# Default TLS settings (ChaCha20-Poly1305 priority for ARMv7 NEON)
+# =====================================================================
+[ ssl_sect ]
+system_default = system_default_sect
+
+[ system_default_sect ]
+MinProtocol = TLSv1.2
+# TLS 1.3: ChaCha20-Poly1305 (71.1 MB/s) ahead of AES-GCM (13.0 MB/s)
+Ciphersuites = TLS_CHACHA20_POLY1305_SHA256:TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384
+# TLS 1.2: prefer ECDHE + ChaCha20-Poly1305
+CipherString = ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:DEFAULT:@SECLEVEL=2
+Options = ServerPreference
+
+# =====================================================================
+# Standard sections for certificate generation (openssl req / ca)
+# =====================================================================
+[ req ]
+default_bits        = 2048
+default_keyfile     = privkey.pem
+distinguished_name  = req_distinguished_name
+attributes          = req_attributes
+x509_extensions     = v3_ca
+string_mask         = utf8only
+
+[ req_distinguished_name ]
+countryName                     = Country Name (2 letter code)
+countryName_default             = RU
+stateOrProvinceName             = State or Province Name (full name)
+localityName                    = Locality Name (eg, city)
+0.organizationName              = Organization Name (eg, company)
+organizationalUnitName          = Organizational Unit Name (eg, section)
+commonName                      = Common Name (e.g. server FQDN or YOUR name)
+commonName_max                  = 64
+emailAddress                    = Email Address
+emailAddress_max                = 64
+
+[ req_attributes ]
+challengePassword               = A challenge password
+challengePassword_min           = 4
+challengePassword_max           = 20
+
+[ v3_ca ]
+subjectKeyIdentifier = hash
+authorityKeyIdentifier = keyid:always,issuer
+basicConstraints = critical,CA:true
