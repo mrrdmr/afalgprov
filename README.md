@@ -23,8 +23,10 @@ ARM Cortex-A9 processors lack hardware AES cryptographic instructions (ARMv8 Cry
 
 ### Key Mechanisms and Design Decisions
 
-* **Zero-Copy `vmsplice` + `splice` Pipeline (`65536`-Byte Chunks):**
-  Instead of copying plaintext through user-space socket buffers on every write, `afalgprov` maps input pages directly into an internal kernel pipe via `vmsplice(..., 0)` and forwards them into the `AF_ALG` operation socket via `splice()` (`SPLICE_F_MORE` for intermediate chunks). Both pipe capacity (`AFALG_PIPE_SZ`) and socket buffers (`SO_SNDBUF`/`SO_RCVBUF`) are tuned to **256 KiB** (`4 × 65536` bytes), avoiding mid-transfer stalls.
+* **Zero-Copy `vmsplice` + `splice` Pipeline (`65536`-Byte Page-Aligned Chunks):**
+  Instead of copying plaintext through user-space socket buffers on every write, `afalgprov` maps input pages directly into an internal kernel pipe via `vmsplice(..., 0)` and forwards them into the `AF_ALG` operation socket via `splice()` (`SPLICE_F_MORE` for intermediate chunks).
+  * **Page Alignment vs. Hardware Descriptor Chaining (`AFALG_SPLICE_CHUNK = 65536`):** A `65,536`-byte (64 KiB) chunk matches exact 4 KiB page boundaries (`16 × 4096` bytes, aligning with Linux `af_alg`'s `ALG_MAX_PAGES = 16`) and avoids splitting standard 64 KiB OpenSSL application buffers into multiple user-space syscall loops. Although the `ls1024a_spacc` kernel driver has a single-descriptor cap of `SPACC_MAX_CHUNK_BYTES = 65520` (`round_down(SZ_64K - 1, AES_BLOCK_SIZE)`), it transparently chains the `65520 + 16`-byte descriptors in kernel space under a single DMA interrupt (IRQ 45).
+  * **Pipe and Socket Buffer Sizing:** Both internal pipe capacity (`AFALG_PIPE_SZ`) and socket buffers (`SO_SNDBUF`/`SO_RCVBUF`) are tuned to **256 KiB** (`4 × 65536` bytes), avoiding mid-transfer stalls.
 * **Empirical Threshold (`16384` Bytes) & Heap-Free Hot Path:**
   Invoking `AF_ALG` incurs `sendmsg`/`vmsplice`/`splice`/`read` syscall overhead and hardware interrupt handling on IRQ 45 (`9b000000.crypto`). Below **`SPACC_HW_THRESHOLD` (16 KiB)**, software AES in `default` outperforms DMA setup; starting at 16 KiB, requests are routed to SPACC. The `CMSG` control buffer (`cbuf`) is pre-allocated once per `AFALG_CTX` lifecycle (`afalg_newctx` / `afalg_dupctx`), eliminating heap allocations during encryption.
 * **In-Place Safety (`out == in`) and IV Synchronization (`iv_dirty` / `sw_unaligned`):**
@@ -123,7 +125,7 @@ sudo cp -an /etc/ssl/openssl.cnf /etc/ssl/openssl.cnf.bak
 ls -l /etc/ssl/openssl.cnf /etc/ssl/openssl.cnf.bak
 ~~~
 
-*(Using `cp -an` ensures an existing original backup `/etc/ssl/openssl.cnf.bak` is never overwritten on subsequent updates. If you ever need to test a modified configuration safely before replacing the system file, validate it first via `OPENSSL_CONF=/tmp/openssl.cnf.test openssl list -providers`.)*
+*(Using `cp -an` ensures an existing original backup `/etc/ssl/openssl.cnf.bak` is never overwritten on subsequent updates. To test a modified configuration safely before replacing the system file, validate it first via `OPENSSL_CONF=/tmp/openssl.cnf.test openssl list -providers`.)*
 
 ### 3.2. Global `/etc/ssl/openssl.cnf` Configuration
 
