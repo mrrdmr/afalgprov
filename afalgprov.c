@@ -775,14 +775,18 @@ static const OSSL_PARAM *afalg_settable_ctx_params(void *cctx, void *provctx)
     };
 
 IMPLEMENT_CIPHER(aes128ctr, "ctr(aes)", "AES-128-CTR", 16, 16, 1,  16, EVP_CIPH_CTR_MODE, 1)
+IMPLEMENT_CIPHER(aes192ctr, "ctr(aes)", "AES-192-CTR", 24, 16, 1,  16, EVP_CIPH_CTR_MODE, 1)
 IMPLEMENT_CIPHER(aes256ctr, "ctr(aes)", "AES-256-CTR", 32, 16, 1,  16, EVP_CIPH_CTR_MODE, 1)
 IMPLEMENT_CIPHER(aes128cbc, "cbc(aes)", "AES-128-CBC", 16, 16, 16, 0,  EVP_CIPH_CBC_MODE, 0)
+IMPLEMENT_CIPHER(aes192cbc, "cbc(aes)", "AES-192-CBC", 24, 16, 16, 0,  EVP_CIPH_CBC_MODE, 0)
 IMPLEMENT_CIPHER(aes256cbc, "cbc(aes)", "AES-256-CBC", 32, 16, 16, 0,  EVP_CIPH_CBC_MODE, 0)
 
 static const OSSL_ALGORITHM afalg_ciphers[] = {
     { "AES-128-CTR:id-aes128-CTR", "provider=afalgprov", dispatch_aes128ctr, "AF_ALG AES-128-CTR" },
+    { "AES-192-CTR:id-aes192-CTR", "provider=afalgprov", dispatch_aes192ctr, "AF_ALG AES-192-CTR" },
     { "AES-256-CTR:id-aes256-CTR", "provider=afalgprov", dispatch_aes256ctr, "AF_ALG AES-256-CTR" },
     { "AES-128-CBC:AES128",        "provider=afalgprov", dispatch_aes128cbc, "AF_ALG AES-128-CBC" },
+    { "AES-192-CBC:AES192",        "provider=afalgprov", dispatch_aes192cbc, "AF_ALG AES-192-CBC" },
     { "AES-256-CBC:AES256",        "provider=afalgprov", dispatch_aes256cbc, "AF_ALG AES-256-CBC" },
     { NULL, NULL, NULL, NULL }
 };
