@@ -1,6 +1,6 @@
 /*
- * afalgprov.c - Production-ready OpenSSL 3.x Provider � AF_ALG (vmsplice/splice)
- * � ����������� fallback ����� EVP. ������������� ��� NXP LS1024A SPACC.
+ * afalgprov.c - Production-ready OpenSSL 3.x Provider с AF_ALG (vmsplice/splice)
+ * и программным fallback через EVP. Оптимизирован для NXP LS1024A SPACC.
  */
 
 #define _GNU_SOURCE
@@ -23,50 +23,48 @@
 #include <openssl/evp.h>
 #include <openssl/crypto.h>
 #include <openssl/provider.h>
-#include <openssl/opensslv.h>
 
 #ifndef SPACC_HW_THRESHOLD
-#define SPACC_HW_THRESHOLD 16384
+#define SPACC_HW_THRESHOLD 8192
 #endif
 
-#define AFALG_SPLICE_CHUNK 32768
-#define AFALG_SOCKBUF (4 * AFALG_SPLICE_CHUNK)
-#define AFALG_PIPE_SZ (4 * AFALG_SPLICE_CHUNK)
+#define AFALG_SPLICE_CHUNK 65536
 #define MAX_KEY_LEN 64
 #define MAX_IV_LEN  16
 
 typedef struct {
-    const char *alg_name;   /* ��� ��������� � Linux Crypto API ("ctr(aes)") */
-    const char *evp_name;   /* ��� ��������� � OpenSSL EVP ("AES-128-CTR") */
-    size_t keylen;          /* ������������� ����� ����� � ������ */
-    size_t ivlen;           /* ����� IV � ������ */
-    size_t blocksize;       /* ������ ����� OpenSSL (1 ��� CTR, 16 ��� CBC) */
-    size_t ctr_step_bytes;  /* ��� �������� CTR � ������ (16 ��� AES-CTR, 0 ��� CBC) */
-    unsigned int mode;      /* ����� OpenSSL (EVP_CIPH_CTR_MODE / EVP_CIPH_CBC_MODE) */
-    int is_ctr;             /* ���� ������ CTR */
+    const char *alg_name;   /* Имя алгоритма в Linux Crypto API ("ctr(aes)") */
+    const char *evp_name;   /* Имя алгоритма в OpenSSL EVP ("AES-128-CTR") */
+    size_t keylen;          /* Фиксированная длина ключа в байтах */
+    size_t ivlen;           /* Длина IV в байтах */
+    size_t blocksize;       /* Размер блока OpenSSL (1 для CTR, 16 для CBC) */
+    size_t ctr_step_bytes;  /* Шаг счётчика CTR в байтах (16 для AES-CTR, 0 для CBC) */
+    unsigned int mode;      /* Режим OpenSSL (EVP_CIPH_CTR_MODE / EVP_CIPH_CBC_MODE) */
+    int is_ctr;             /* Флаг режима CTR */
 } AFALG_CIPHER_INFO;
 
 typedef struct {
     const AFALG_CIPHER_INFO *info;
     OSSL_LIB_CTX *libctx;
 
-    /* ����������� ���� */
+    /* Дескрипторы ядра */
     int tfmfd;
     int opfd;
-    int pipe_fds[2];        /* ������������� pipe ��� vmsplice/splice */
+    int pipe_fds[2];        /* Предсозданный pipe для vmsplice/splice */
 
-    /* ����������������� ��������� */
+    /* Криптографическое состояние */
     uint8_t key[MAX_KEY_LEN];
     size_t keylen;
-    int key_initialized;    /* 1 = ���� ���������� ����� init */
+    int key_initialized;    /* 1 = ключ установлен через init */
     uint8_t iv[MAX_IV_LEN];
     size_t ivlen;
     int enc;                /* 1 = encrypt, 0 = decrypt */
-    int pad;                /* 1 = PKCS#7 padding �������, 0 = �������� */
+    int pad;                /* 1 = PKCS#7 padding включён, 0 = выключен */
     int hw_key_set;
-    int iv_dirty;           /* 1 = IV ������� � HW � ������� ������������� �� SW */
+    int iv_dirty;           /* 1 = IV изменён в HW и требует синхронизации со SW */
+    int sw_unaligned;       /* 1 = в SW обработан некратный блоку кусок (остаёмся в SW) */
 
-    /* Software Fallback �������� */
+    /* Software Fallback контекст */
     EVP_CIPHER *sw_cipher;
     EVP_CIPHER_CTX *sw_ctx;
 } AFALG_CTX;
@@ -74,20 +72,8 @@ typedef struct {
 static int afalg_set_ctx_params(void *vctx, const OSSL_PARAM params[]);
 
 /* =========================================================================
- * ��������������� ������� ������������ � ������ � �����
+ * Вспомогательные функции криптографии и работы с ядром
  * ========================================================================= */
-
-static int afalg_get_updated_iv(EVP_CIPHER_CTX *ctx, unsigned char *iv, size_t ivlen)
-{
-#if OPENSSL_VERSION_NUMBER >= 0x30100000L
-    return EVP_CIPHER_CTX_get_updated_iv(ctx, iv, ivlen);
-#else
-    OSSL_PARAM params[2];
-    params[0] = OSSL_PARAM_construct_octet_string(OSSL_CIPHER_PARAM_UPDATED_IV, iv, ivlen);
-    params[1] = OSSL_PARAM_construct_end();
-    return EVP_CIPHER_CTX_get_params(ctx, params);
-#endif
-}
 
 static int afalg_check_key(const AFALG_CTX *ctx)
 {
@@ -113,6 +99,24 @@ static void afalg_ctr_add_blocks(uint8_t *iv, uint64_t blocks)
 
     memcpy(iv, &high, sizeof(uint64_t));
     memcpy(iv + sizeof(uint64_t), &next_low, sizeof(uint64_t));
+}
+
+/* Единое обновление ctx->iv для выровненных блоков (используется в HW и SW) */
+static void afalg_advance_iv(AFALG_CTX *ctx, const uint8_t *in_block,
+                             const uint8_t *out_block, size_t len)
+{
+    if (ctx->info->is_ctr) {
+        afalg_ctr_add_blocks(ctx->iv, len / ctx->info->ctr_step_bytes);
+    } else {
+        size_t blk = ctx->info->blocksize;
+        if (ctx->ivlen >= blk && len >= blk) {
+            if (ctx->enc) {
+                memcpy(ctx->iv, out_block, blk);
+            } else {
+                memcpy(ctx->iv, in_block, blk);
+            }
+        }
+    }
 }
 
 static int afalg_ensure_sw(AFALG_CTX *ctx)
@@ -155,14 +159,6 @@ static int afalg_init_hw(AFALG_CTX *ctx)
     if (ctx->pipe_fds[0] < 0) {
         if (pipe2(ctx->pipe_fds, O_CLOEXEC) < 0)
             return 0;
-
-        /*
-         * The pipe must hold a whole chunk even when the caller's buffer is
-         * not page aligned: a 64 KiB vmsplice needs 17 pages and would block
-         * forever in a default 16-page pipe, because splice() only runs after
-         * vmsplice() returns.
-         */
-        fcntl(ctx->pipe_fds[1], F_SETPIPE_SZ, AFALG_PIPE_SZ);
     }
 
     if (ctx->tfmfd < 0) {
@@ -215,8 +211,8 @@ static void afalg_reset_hw_descriptors(AFALG_CTX *ctx)
 }
 
 /*
- * �������� ����� vmsplice(..., 0) + splice() � ���������� ��������� ��������,
- * EINTR, ������������ CMSG-������� � ��������� ������� ������������ ���� (*done).
+ * Передача через vmsplice(..., 0) + splice() с обработкой частичных операций,
+ * EINTR, динамическим CMSG-буфером и возвратом реально обработанных байт (*done).
  */
 static int afalg_hw_zero_copy(AFALG_CTX *ctx, const uint8_t *in, uint8_t *out,
                               size_t len, size_t *done)
@@ -283,7 +279,7 @@ static int afalg_hw_zero_copy(AFALG_CTX *ctx, const uint8_t *in, uint8_t *out,
                 goto cleanup;
         }
 
-        /* 1. ������ ���� vmsplice(..., 0) */
+        /* 1. Полный цикл vmsplice(..., 0) */
         size_t submitted = 0;
         while (submitted < chunk) {
             struct iovec iov = {
@@ -301,7 +297,7 @@ static int afalg_hw_zero_copy(AFALG_CTX *ctx, const uint8_t *in, uint8_t *out,
             submitted += (size_t)rc;
         }
 
-        /* 2. ������ ���� splice() �� pipe � opfd */
+        /* 2. Полный цикл splice() из pipe в opfd */
         size_t forwarded = 0;
         while (forwarded < submitted) {
             int flags = (processed + forwarded < len) ? SPLICE_F_MORE : 0;
@@ -317,7 +313,7 @@ static int afalg_hw_zero_copy(AFALG_CTX *ctx, const uint8_t *in, uint8_t *out,
             forwarded += (size_t)rc;
         }
 
-        /* 3. ������ ���� read() ���������� �� opfd */
+        /* 3. Полный цикл read() результата из opfd */
         size_t read_bytes = 0;
         while (read_bytes < chunk) {
             ssize_t r = read(ctx->opfd, out + processed + read_bytes, chunk - read_bytes);
@@ -331,16 +327,8 @@ static int afalg_hw_zero_copy(AFALG_CTX *ctx, const uint8_t *in, uint8_t *out,
             read_bytes += (size_t)r;
         }
 
-        /* ��������� IV ����� ��������� ������������ ����� */
-        if (ctx->info->is_ctr) {
-            afalg_ctr_add_blocks(ctx->iv, chunk / ctx->info->ctr_step_bytes);
-        } else if (ctx->ivlen >= blk && chunk >= blk) {
-            if (ctx->enc) {
-                memcpy(ctx->iv, out + processed + chunk - blk, blk);
-            } else {
-                memcpy(ctx->iv, saved_last_in, blk);
-            }
-        }
+        /* Обновляем IV после полностью завершённого чанка */
+        afalg_advance_iv(ctx, saved_last_in, out + processed + chunk - blk, chunk);
         ctx->iv_dirty = 1;
         processed += chunk;
     }
@@ -357,7 +345,7 @@ cleanup:
 }
 
 /* =========================================================================
- * ��������� ���� ��������� OpenSSL Provider
+ * Жизненный цикл контекста OpenSSL Provider
  * ========================================================================= */
 
 static void *afalg_newctx(void *provctx, const AFALG_CIPHER_INFO *info)
@@ -437,7 +425,7 @@ static void *afalg_dupctx(void *vctx)
 }
 
 /* =========================================================================
- * �������� ���������� (Init / Update / Final)
+ * Операции шифрования (Init / Update / Final)
  * ========================================================================= */
 
 static int afalg_init_common(void *vctx, const unsigned char *key, size_t keylen,
@@ -476,6 +464,7 @@ static int afalg_init_common(void *vctx, const unsigned char *key, size_t keylen
             return 0;
     }
     ctx->iv_dirty = 0;
+    ctx->sw_unaligned = 0;
 
     return afalg_set_ctx_params(ctx, params);
 }
@@ -506,10 +495,6 @@ static int afalg_sw_only_update(AFALG_CTX *ctx, unsigned char *out, size_t *outl
     if (!EVP_CipherUpdate(ctx->sw_ctx, out, &sw_outl, in, (int)inl))
         return 0;
 
-    if (ctx->ivlen > 0) {
-        if (!afalg_get_updated_iv(ctx->sw_ctx, ctx->iv, ctx->ivlen))
-            return 0;
-    }
     *outl = (size_t)sw_outl;
     return 1;
 }
@@ -527,11 +512,12 @@ static int afalg_update(void *vctx, unsigned char *out, size_t *outl, size_t out
         return 1;
 
     /*
-     * CBC � ���������� PKCS#7 padding ��� ������� ����� EVP, ����� �� ���������
-     * ���������� ��������� ������ �������� ����� HW � SW.
-     * � HW ����: CTR � CBC ��� padding (pad == 0).
+     * 1. Поток, уже ушедший в SW на невыровненном куске, остаётся в SW.
+     * 2. Для CBC DECRYPT с padding используем SW целиком, так как EVP 
+     *    внутренне буферизует последний блок, что несовместимо с HW zero-copy.
+     * 3. CBC ENCRYPT с padding безопасно использует HW для полных блоков.
      */
-    if (!ctx->info->is_ctr && ctx->pad) {
+    if (ctx->sw_unaligned || (!ctx->info->is_ctr && ctx->pad && !ctx->enc)) {
         return afalg_sw_only_update(ctx, out, outl, outsize, in, inl);
     }
 
@@ -565,6 +551,12 @@ static int afalg_update(void *vctx, unsigned char *out, size_t *outl, size_t out
         if (outsize < required)
             return 0;
 
+        uint8_t saved_last_in[EVP_MAX_BLOCK_LENGTH];
+        size_t blk = ctx->info->blocksize;
+        if (!ctx->info->is_ctr && !ctx->enc && blk <= sizeof(saved_last_in) && rem_len >= blk) {
+            memcpy(saved_last_in, in + hw_written + rem_len - blk, blk);
+        }
+
         if (!afalg_ensure_sw(ctx))
             return 0;
 
@@ -572,9 +564,10 @@ static int afalg_update(void *vctx, unsigned char *out, size_t *outl, size_t out
         if (!EVP_CipherUpdate(ctx->sw_ctx, out + hw_written, &sw_outl, in + hw_written, (int)rem_len))
             return 0;
 
-        if (ctx->ivlen > 0) {
-            if (!afalg_get_updated_iv(ctx->sw_ctx, ctx->iv, ctx->ivlen))
-                return 0;
+        if ((rem_len & (hw_align - 1)) == 0) {
+            afalg_advance_iv(ctx, saved_last_in, out + hw_written + rem_len - blk, rem_len);
+        } else {
+            ctx->sw_unaligned = 1;
         }
         *outl = hw_written + (size_t)sw_outl;
     } else {
@@ -611,7 +604,7 @@ static int afalg_final(void *vctx, unsigned char *out, size_t *outl, size_t outs
 }
 
 /* =========================================================================
- * ��������� ���������� � ��������� (OSSL_PARAM)
+ * Параметры алгоритмов и контекста (OSSL_PARAM)
  * ========================================================================= */
 
 static int afalg_get_params(OSSL_PARAM params[], const AFALG_CIPHER_INFO *info)
@@ -723,7 +716,7 @@ static const OSSL_PARAM *afalg_settable_ctx_params(void *cctx, void *provctx)
 }
 
 /* =========================================================================
- * ������� ��������������� ������ � ���������� ����������
+ * Таблицы диспетчеризации шифров и метаданные провайдера
  * ========================================================================= */
 
 #define IMPLEMENT_CIPHER(name, alg, evp, klen, ivl, blk, ctr_step, cmode, ctr) \
@@ -748,18 +741,14 @@ static const OSSL_PARAM *afalg_settable_ctx_params(void *cctx, void *provctx)
     };
 
 IMPLEMENT_CIPHER(aes128ctr, "ctr(aes)", "AES-128-CTR", 16, 16, 1,  16, EVP_CIPH_CTR_MODE, 1)
-IMPLEMENT_CIPHER(aes192ctr, "ctr(aes)", "AES-192-CTR", 24, 16, 1,  16, EVP_CIPH_CTR_MODE, 1)
 IMPLEMENT_CIPHER(aes256ctr, "ctr(aes)", "AES-256-CTR", 32, 16, 1,  16, EVP_CIPH_CTR_MODE, 1)
 IMPLEMENT_CIPHER(aes128cbc, "cbc(aes)", "AES-128-CBC", 16, 16, 16, 0,  EVP_CIPH_CBC_MODE, 0)
-IMPLEMENT_CIPHER(aes192cbc, "cbc(aes)", "AES-192-CBC", 24, 16, 16, 0,  EVP_CIPH_CBC_MODE, 0)
 IMPLEMENT_CIPHER(aes256cbc, "cbc(aes)", "AES-256-CBC", 32, 16, 16, 0,  EVP_CIPH_CBC_MODE, 0)
 
 static const OSSL_ALGORITHM afalg_ciphers[] = {
     { "AES-128-CTR:id-aes128-CTR", "provider=afalgprov", dispatch_aes128ctr, "AF_ALG AES-128-CTR" },
-    { "AES-192-CTR:id-aes192-CTR", "provider=afalgprov", dispatch_aes192ctr, "AF_ALG AES-192-CTR" },
     { "AES-256-CTR:id-aes256-CTR", "provider=afalgprov", dispatch_aes256ctr, "AF_ALG AES-256-CTR" },
     { "AES-128-CBC:AES128",        "provider=afalgprov", dispatch_aes128cbc, "AF_ALG AES-128-CBC" },
-    { "AES-192-CBC",               "provider=afalgprov", dispatch_aes192cbc, "AF_ALG AES-192-CBC" },
     { "AES-256-CBC:AES256",        "provider=afalgprov", dispatch_aes256cbc, "AF_ALG AES-256-CBC" },
     { NULL, NULL, NULL, NULL }
 };
@@ -805,12 +794,8 @@ static const OSSL_ALGORITHM *afalg_query(void *provctx, int operation_id, int *n
     return NULL;
 }
 
-static OSSL_PROVIDER *afalg_default_prov;
-
 static void afalg_teardown(void *provctx)
 {
-    OSSL_PROVIDER_unload(afalg_default_prov);
-    afalg_default_prov = NULL;
     OSSL_LIB_CTX_free((OSSL_LIB_CTX *)provctx);
 }
 
@@ -829,17 +814,8 @@ int OSSL_provider_init(const OSSL_CORE_HANDLE *handle, const OSSL_DISPATCH *in,
     if (libctx == NULL)
         return 0;
 
-    /*
-     * The software fallback fetches from the default provider by name, so it
-     * has to be present in our library context.  When the caller loads only
-     * this provider (-provider afalgprov) it would not be, and every operation
-     * would fail instead of falling back.
-     */
-    afalg_default_prov = OSSL_PROVIDER_load(libctx, "default");
-    if (afalg_default_prov == NULL) {
-        OSSL_LIB_CTX_free(libctx);
-        return 0;
-    }
+    /* Явно подгружаем default-провайдер во внутренний контекст для работы SW fallback */
+    OSSL_PROVIDER_load(libctx, "default");
 
     *provctx = libctx;
     *out = afalg_dispatch_table;
