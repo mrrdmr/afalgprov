@@ -1,9 +1,10 @@
 /*
  * afalgprov.c - OpenSSL 3.5 AF_ALG Zero-Copy Provider for NXP LS1024A (SPACC DMA)
  *
- * Offloads aligned streaming AES-128/192/256 (CTR and CBC) buffers >= 16384 bytes
+ * Offloads aligned streaming AES-128/192/256 (CTR and CBC) buffers >= 8192 bytes
  * to the Linux kernel AF_ALG interface via a zero-copy vmsplice + splice pipeline
- * (65536-byte page-aligned chunks), with transparent fallback to OpenSSL's
+ * (57344-byte chunks = 14 pages, fitting within SPACC's 16-entry DDT hardware
+ * limit even for unaligned user buffers), with transparent fallback to OpenSSL's
  * default provider for small buffers, unaligned tails, and padded CBC decryption.
  */
 
@@ -35,9 +36,14 @@
 #define SOL_ALG 279
 #endif
 
-/* Tuned for NXP LS1024A SPACC (9b000000.crypto) + Linux ALG_MAX_PAGES (16 * 4096) */
-#define SPACC_HW_THRESHOLD  16384U
-#define AFALG_SPLICE_CHUNK  65536U
+/*
+ * Tuned for NXP LS1024A SPACC (9b000000.crypto):
+ * Hardware DDT prefetcher stops at 16 entries (15 data + 1 terminator).
+ * 14 * 4096 = 57344 bytes spans at most 15 physical pages even when unaligned,
+ * avoiding DDT splits while remaining a multiple of both 4096 and AES_BLOCK_SZ.
+ */
+#define SPACC_HW_THRESHOLD  8192U
+#define AFALG_SPLICE_CHUNK  57344U
 #define AFALG_PIPE_SZ       (4U * AFALG_SPLICE_CHUNK)
 
 #define AES_BLOCK_SZ        16U
