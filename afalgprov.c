@@ -86,6 +86,7 @@ typedef struct {
     int iv_set;
     int iv_dirty;           /* 1 if ctx->iv is ahead of sw_ctx and needs resync before SW fallback */
     int sw_unaligned;
+    size_t sw_cbc_rem;
     unsigned int num;
 
     uint8_t key[AES_MAX_KEY_SZ];
@@ -507,6 +508,7 @@ static void *afalg_dupctx(void *vctx)
     dst->iv_set = src->iv_set;
     dst->iv_dirty = src->iv_dirty;
     dst->sw_unaligned = src->sw_unaligned;
+    dst->sw_cbc_rem = src->sw_cbc_rem;
     dst->num = src->num;
 
     memcpy(dst->key, src->key, sizeof(dst->key));
@@ -559,6 +561,7 @@ static int afalg_init_common(void *vctx,
     ctx->enc = enc;
     ctx->num = 0;
     ctx->sw_unaligned = 0;
+    ctx->sw_cbc_rem = 0;
 
     if (iv != NULL) {
         if (ivlen != ctx->info->iv_len) {
@@ -568,6 +571,9 @@ static int afalg_init_common(void *vctx,
         memcpy(ctx->iv, iv, ivlen);
         memcpy(ctx->orig_iv, iv, ivlen);
         ctx->iv_set = 1;
+        ctx->iv_dirty = 1;
+    } else if (ctx->iv_set) {
+        memcpy(ctx->iv, ctx->orig_iv, ctx->info->iv_len);
         ctx->iv_dirty = 1;
     }
 
@@ -638,8 +644,8 @@ static int afalg_process_sw(AFALG_CTX *ctx,
         size_t step = inl - offset;
         int step_outl = 0;
 
-        if (step > (size_t)INT_MAX)
-            step = (size_t)INT_MAX;
+        if (step > (size_t)INT_MAX - AES_BLOCK_SZ)
+            step = (size_t)INT_MAX - AES_BLOCK_SZ;
 
         if (!EVP_CipherUpdate(ctx->sw_ctx, out + total_out, &step_outl,
                               in + offset, (int)step))
@@ -652,9 +658,14 @@ static int afalg_process_sw(AFALG_CTX *ctx,
         offset += step;
     }
 
-    if (ctx->info->is_ctr && (inl % AES_BLOCK_SZ != 0)) {
-        ctx->sw_unaligned = 1;
-    } else if (!ctx->sw_unaligned) {
+    if (ctx->info->is_ctr) {
+        if (inl % AES_BLOCK_SZ != 0)
+            ctx->sw_unaligned = 1;
+    } else {
+        ctx->sw_cbc_rem = (ctx->sw_cbc_rem + inl) % AES_BLOCK_SZ;
+    }
+
+    if (!ctx->sw_unaligned && ctx->sw_cbc_rem == 0) {
         if (!afalg_sync_iv_from_sw(ctx))
             return 0;
     }
@@ -747,6 +758,7 @@ static int afalg_update(void *vctx,
      *   3. Buffer is smaller than empirical DMA threshold.
      */
     if (ctx->sw_unaligned ||
+        ctx->sw_cbc_rem != 0 ||
         (!ctx->info->is_ctr && !ctx->enc && ctx->padding) ||
         inl < ctx->hw_threshold) {
         return afalg_process_sw(ctx, out, outl, outsize, in, inl);
@@ -976,6 +988,8 @@ static int afalg_set_ctx_params(void *vctx, const OSSL_PARAM params[])
         if (!OSSL_PARAM_get_uint(p, &num))
             return 0;
         ctx->num = num;
+        if (ctx->info->is_ctr && num != 0)
+            ctx->sw_unaligned = 1;
         if (ctx->sw_ctx != NULL)
             (void)EVP_CIPHER_CTX_set_num(ctx->sw_ctx, (int)num);
     }
