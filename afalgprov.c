@@ -57,7 +57,7 @@ typedef struct {
 
 typedef struct {
     OSSL_LIB_CTX *libctx;
-    OSSL_PROVIDER *default_prov; /* non-NULL only if parent had no default provider */
+    OSSL_PROVIDER *default_prov;
     size_t hw_threshold;
 } AFALG_PROV_CTX;
 
@@ -84,7 +84,7 @@ typedef struct {
     int padding;
     int key_set;
     int iv_set;
-    int iv_dirty;
+    int iv_dirty;           /* 1 if ctx->iv is ahead of sw_ctx and needs resync before SW fallback */
     int sw_unaligned;
     unsigned int num;
 
@@ -328,9 +328,8 @@ static int afalg_hw_zero_copy(AFALG_CTX *ctx,
         if (errno == EINTR)
             continue;
         return 0;
-    ctx->iv_dirty = 0;
-        ctx->iv_dirty = 0;
     }
+    ctx->iv_dirty = 0;
 
     while (processed < len) {
         size_t chunk = len - processed;
