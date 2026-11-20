@@ -244,7 +244,7 @@ Restore the original `/etc/ssl/openssl.cnf` from `/etc/ssl/openssl.cnf.bak`, rem
 ~~~bash
 sudo cp -a /etc/ssl/openssl.cnf.bak /etc/ssl/openssl.cnf
 sudo rm -f /etc/modules-load.d/ktls.conf
-sudo make -C /data/shared/afalgprov uninstall
+sudo make -C uninstall
 sudo systemctl restart ssh
 openssl list -providers
 ~~~
