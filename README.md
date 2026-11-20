@@ -193,7 +193,7 @@ To enable SPACC offloading only for specific services (e.g., OpenVPN, `stunnel`,
 sudo systemctl restart ssh
 openssl list -providers
 openssl list -cipher-algorithms -provider afalgprov | grep "@ afalgprov"
-openssl ciphers -v -tls1_3
+openssl ciphers -v -s -tls1_3
 ~~~
 
 ### Verify kTLS Offloading for `TLS_AES_128_GCM_SHA256`
