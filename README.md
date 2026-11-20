@@ -2,6 +2,8 @@
 
 A dynamic cryptographic provider for **OpenSSL 3.5** on the **NXP LS1024A** platform (ARM Cortex-A9, `OPENSSL_armcap=0x1`, Debian `arm-linux-gnueabihf`), providing hardware offloading of symmetric encryption via the Linux kernel **`AF_ALG`** socket interface (`vmsplice`/`splice` pipeline) and the **SPACC (`9b000000.crypto`)** cryptographic DMA engine.
 
+- **Target Kernel Tree:** [symops/MCG1-6.18](https://github.com/symops/MCG1-6.18) with SPACC/crypto updates from [PR #13](https://github.com/symops/MCG1-6.18/pull/13).
+
 ---
 
 ## 1. Purpose and Architecture
@@ -103,9 +105,12 @@ sudo apt-get update
 sudo apt-get install -y build-essential libssl-dev
 ~~~
 
-### 2.2. Verify Hardware Crypto Engine and Kernel Modules (including `tls` for kTLS)
+### 2.2. Verify Kernel Version (`MCG1-6.18` + `PR #13`) and Crypto Modules
+
+This provider targets the custom Linux kernel from **[symops/MCG1-6.18](https://github.com/symops/MCG1-6.18)** with the SPACC DMA / `AF_ALG` patches applied in **[PR #13](https://github.com/symops/MCG1-6.18/pull/13)**.
 
 ~~~bash
+uname -a
 grep crypto /proc/interrupts
 grep -B 1 -A 14 -E "name\s*:\s*(cbc|ctr)\(aes\)" /proc/crypto
 lsmod | grep -E "af_alg|algif_skcipher|ls1024a_spacc"
