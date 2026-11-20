@@ -1,5 +1,5 @@
 /*
- * afalgprov.c � OpenSSL 3.5 AF_ALG Zero-Copy Provider for NXP LS1024A (SPACC DMA)
+ * afalgprov.c - OpenSSL 3.5 AF_ALG Zero-Copy Provider for NXP LS1024A (SPACC DMA)
  *
  * Offloads aligned streaming AES-128/192/256 (CTR and CBC) buffers >= 16384 bytes
  * to the Linux kernel AF_ALG interface via a zero-copy vmsplice + splice pipeline
