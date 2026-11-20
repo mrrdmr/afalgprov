@@ -167,7 +167,7 @@ activate = 1
 [afalgprov_sect]
 module = /usr/lib/arm-linux-gnueabihf/ossl-modules/afalgprov.so
 activate = 1
-hw-threshold = 16384
+hw-threshold = 8192
 
 [evp_properties]
 default_properties = ?provider=afalgprov
