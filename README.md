@@ -204,20 +204,20 @@ openssl req -x509 -newkey rsa:2048 -nodes \
   -days 1 -subj "/CN=localhost" 2>/dev/null
 
 openssl s_server -accept 14434 -cert /tmp/ktls_cert.pem -key /tmp/ktls_key.pem \
-  -ciphersuites TLS_AES_128_GCM_SHA256 -www >/dev/null 2>&1 &
+  -ciphersuites TLS_AES_128_GCM_SHA256 -ktls -www >/dev/null 2>&1 &
 SRV_PID=$!
 sleep 0.5
 
 (printf "GET / HTTP/1.0\r\n\r\n"; sleep 0.2) | \
   openssl s_client -connect 127.0.0.1:14434 \
-  -ciphersuites TLS_AES_128_GCM_SHA256 -brief
+  -ciphersuites TLS_AES_128_GCM_SHA256 -ktls -brief
 
 grep -E "Tls(Tx|Rx)Sw|TlsDecryptError" /proc/net/tls_stat
 kill $SRV_PID 2>/dev/null; wait $SRV_PID 2>/dev/null
 rm -f /tmp/ktls_key.pem /tmp/ktls_cert.pem
 ~~~
 
-*(Expected result: `TlsTxSw` and `TlsRxSw` counters increment with `TlsDecryptError` remaining `0`.)*
+*(Expected output includes `Using Kernel TLS for sending`, `Using Kernel TLS for receiving`, and incremented `TlsTxSw` / `TlsRxSw` counters with `TlsDecryptError` remaining `0`.)*
 
 ### End-to-End Byte-Exactness Check (`AES-128 / 192 / 256`)
 
