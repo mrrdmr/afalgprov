@@ -42,7 +42,7 @@
  * 14 * 4096 = 57344 bytes spans at most 15 physical pages even when unaligned,
  * avoiding DDT splits while remaining a multiple of both 4096 and AES_BLOCK_SZ.
  */
-#define SPACC_HW_THRESHOLD  8192U
+#define SPACC_HW_THRESHOLD  16384U
 #define AFALG_SPLICE_CHUNK  57344U
 #define AFALG_PIPE_SZ       (4U * AFALG_SPLICE_CHUNK)
 
