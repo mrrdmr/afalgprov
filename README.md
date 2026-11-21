@@ -46,18 +46,18 @@ ARM Cortex-A9 processors lack hardware AES cryptographic instructions (ARMv8 Cry
 
 ### Performance Benchmarks on NXP LS1024A
 
-Measured throughput and CPU utilization on the **NXP LS1024A** board (OpenSSL 3.5.7, ARM Cortex-A9, `OPENSSL_armcap=0x1`) using `65,536`-byte (64 KB) blocks with `-elapsed` (wall-clock time) and `/usr/bin/time -p`:
+Measured throughput and CPU utilization on the **NXP LS1024A** board (OpenSSL 3.5.7, ARM Cortex-A9, `OPENSSL_armcap=0x1`) using `65,536`-byte (64 KB) blocks with `-elapsed` (wall-clock time) and `/usr/bin/time -p` (`22,376` SPACC DMA interrupts recorded across all 6 hardware runs, matching `11,188` 64 KB blocks split into 2 hardware chunks per block):
 
 | Algorithm and Mode | Pure CPU (`OPENSSL_CONF=/dev/null`, `default` only) | Hardware SPACC (`afalgprov`, DMA IRQ 45) | Throughput Gain | CPU Time (`user + sys` over ~3.07s run) | Role in System |
 | :--- | :--- | :--- | :--- | :--- | :--- |
-| **`AES-128-CTR`** | **29.0 MB/s** (`29,011 k`) | **45.6 MB/s** (`45,613 k`) | **+57.2% (1.57x)** | Reduced from **100%** (`3.04s + 0.02s`) to **26.7%** (`0.06s + 0.76s`) — **3.7x less CPU** | `OpenSSH`, `SFTP`, `SCP` (`aes128-ctr`) |
-| **`AES-128-CBC`** | **22.3 MB/s** (`22,348 k`) | **45.7 MB/s** (`45,744 k`) | **+104.7% (2.05x)** | Reduced from **100%** (`3.03s + 0.03s`) to **26.7%** (`0.06s + 0.76s`) — **3.7x less CPU** | `openssl enc`, file/backup encryption |
-| **`AES-192-CTR`** | **24.5 MB/s** (`24,510 k`) | **45.7 MB/s** (`45,722 k`) | **+86.5% (1.87x)** | Reduced from **100%** (`3.04s + 0.02s`) to **25.4%** (`0.06s + 0.72s`) — **3.9x less CPU** | Streaming channels (192-bit) |
-| **`AES-192-CBC`** | **19.6 MB/s** (`19,639 k`) | **45.9 MB/s** (`45,941 k`) | **+133.9% (2.34x)** | Reduced from **100%** (`3.04s + 0.02s`) to **25.7%** (`0.07s + 0.72s`) — **3.9x less CPU** | Data encryption (192-bit) |
-| **`AES-256-CTR`** | **21.3 MB/s** (`21,272 k`) | **45.6 MB/s** (`45,635 k`) | **+114.5% (2.15x)** | Reduced from **100%** (`3.04s + 0.02s`) to **25.1%** (`0.07s + 0.70s`) — **4.0x less CPU** | `OpenSSH` (`aes256-ctr`), `openssl enc` |
-| **`AES-256-CBC`** | **17.1 MB/s** (`17,127 k`) | **45.8 MB/s** (`45,810 k`) | **+167.5% (2.67x)** | Reduced from **100%** (`3.05s + 0.01s`) to **27.0%** (`0.08s + 0.75s`) — **3.7x less CPU** | `openssl enc -aes-256-cbc`, TLS 1.3 Session Tickets |
-| **`ChaCha20-Poly1305`** | **61.2 MB/s** (`61,211 k`) | *Not supported by SPACC* | Fastest AEAD on CPU | ~100% of 1 CPU core (ARMv7 NEON) | Primary cipher for TLS 1.3 / HTTPS |
-| **`AES-128-GCM`** | **12.9 MB/s** (`12,867 k`) | *Offloaded to Kernel via `kTLS`* | **-58% CPU** via kTLS | User-space CPU cut from `11.36s` to `0.45s` (128 MB TLS 1.3 transfer) | TLS 1.3 compatibility (`Options = KTLS`) |
+| **`AES-128-CTR`** | **29.0 MB/s** (`28,967 k`) | **40.8 MB/s** (`40,829 k`) | **+41.0% (1.41x)** | Reduced from **100%** (`3.04s + 0.02s`) to **35.5%** (`0.08s + 1.01s`) — **2.8x less CPU** | `OpenSSH`, `SFTP`, `SCP` (`aes128-ctr`) |
+| **`AES-128-CBC`** | **22.3 MB/s** (`22,326 k`) | **40.6 MB/s** (`40,610 k`) | **+81.9% (1.82x)** | Reduced from **100%** (`3.04s + 0.02s`) to **32.6%** (`0.08s + 0.92s`) — **3.1x less CPU** | `openssl enc`, file/backup encryption |
+| **`AES-192-CTR`** | **24.5 MB/s** (`24,532 k`) | **40.9 MB/s** (`40,894 k`) | **+66.7% (1.67x)** | Reduced from **100%** (`3.03s + 0.02s`) to **34.5%** (`0.05s + 1.01s`) — **2.9x less CPU** | Streaming channels (192-bit) |
+| **`AES-192-CBC`** | **19.6 MB/s** (`19,639 k`) | **40.6 MB/s** (`40,632 k`) | **+106.9% (2.07x)** | Reduced from **100%** (`3.05s + 0.01s`) to **35.8%** (`0.06s + 1.04s`) — **2.8x less CPU** | Data encryption (192-bit) |
+| **`AES-256-CTR`** | **21.2 MB/s** (`21,228 k`) | **40.8 MB/s** (`40,829 k`) | **+92.3% (1.92x)** | Reduced from **100%** (`3.04s + 0.02s`) to **41.0%** (`0.08s + 1.18s`) — **2.4x less CPU** | `OpenSSH` (`aes256-ctr`), `openssl enc` |
+| **`AES-256-CBC`** | **17.1 MB/s** (`17,127 k`) | **40.6 MB/s** (`40,610 k`) | **+137.1% (2.37x)** | Reduced from **100%** (`3.03s + 0.02s`) to **33.6%** (`0.07s + 0.96s`) — **3.0x less CPU** | `openssl enc -aes-256-cbc`, TLS 1.3 Session Tickets |
+| **`ChaCha20-Poly1305`** | **60.8 MB/s** (`60,817 k`) | *Not supported by SPACC* | Fastest AEAD on CPU | ~100% of 1 CPU core (ARMv7 NEON) | Primary cipher for TLS 1.3 / HTTPS |
+| **`AES-128-GCM`** | **12.8 MB/s** (`12,845 k`) | *Offloaded to Kernel via `kTLS`* | **-58% CPU** via kTLS | User-space CPU cut from `11.36s` to `0.45s` (128 MB TLS 1.3 transfer) | TLS 1.3 compatibility (`Options = KTLS`) |
 
 #### TLS 1.3 `AES-128-GCM` Loopback Benchmark (128 MiB Transfer, 64 KiB Chunks)
 
