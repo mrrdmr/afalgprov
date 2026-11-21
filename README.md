@@ -63,8 +63,8 @@ Measured throughput and CPU utilization on the **NXP LS1024A** board (OpenSSL 3.
 
 | TLS 1.3 Configuration | kTLS State (`TX / RX`) | Loopback Throughput | Transfer Time | Client CPU Time (`user + sys`) |
 | :--- | :--- | :--- | :--- | :--- |
-| **User-Space OpenSSL (`kTLS OFF`)** | `0 / 0` | 10.41 MB/s | 12.29 s | **11.94 s** (`11.36s user + 0.58s sys`) |
-| **Kernel TLS (`Options = KTLS`)** | `1 / 1` (`TlsTxSw`/`TlsRxSw`) | **11.19 MB/s** (+7.5%) | **11.44 s** | **5.02 s** (`0.45s user + 4.57s sys` — **-58% CPU**) |
+| **User-Space OpenSSL (`kTLS OFF`)** | `0 / 0` | 9.20 MB/s | 13.91 s | **13.28 s** (`12.37s user + 0.91s sys`) |
+| **Kernel TLS (`Options = KTLS`)** | `2 / 2` (`TlsTxSw`/`TlsRxSw`) | **9.84 MB/s** (+7.0%) | **13.01 s** | **3.47 s** (`1.17s user + 2.30s sys` — **-73.9% CPU**) |
 
 ### Key Takeaways from Benchmarks
 1. **Constant ~45.6–45.9 MB/s Hardware Ceiling Across All Key Lengths (128/192/256-bit):**
