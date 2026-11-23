@@ -10,7 +10,7 @@ Hardware-accelerated **OpenSSL 3.5+** provider built on the Linux `AF_ALG` socke
 
 ### Prerequisites
 
-* `gcc` and OpenSSL 3.x development headers (`libssl-dev`).
+`gcc` and OpenSSL 3.x development headers (`libssl-dev`).
 
 ### Compile and Install
 
