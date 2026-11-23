@@ -24,15 +24,17 @@ High-throughput OpenSSL 3.5+ `EVP_CIPHER` provider for the **NXP LS1024A** (Dual
 | **`AES-256-CTR`** *(`afalgprov`)* | `256 KiB` | 1 | **`45.70 MB/s`** | **`23.7%`** | Zero penalty for 256-bit keys (`1.93 MB/s` per 1% core). |
 | **`AES-256-CTR`** *(`afalgprov`)* | `256 KiB` | 4 (`-multi 4`) | **`69.21 MB/s`** | **`72.8%`** | Peak multi-stream `AES-256-CTR` SPACC throughput. |
 | **`AES-128-GCM`** *(Pure CPU)* | `256 KiB` | 1 | `12.76 MB/s` | `99.7%` | Baseline software AEAD (saturates 1 core). |
-| **`AES-128-GCM`** *(`afalgprov`)* | `256 KiB` | 1 / 4 | **`31.53` / `32.45 MB/s`** | **`16.2%` / `30.7%`** | **2.47×** faster, **6.1×** lower CPU load (`SPACC + ghash-ce`). |
-| **`AES-256-GCM`** *(`afalgprov`)* | `256 KiB` | 1 / 4 | **`31.46` / `32.46 MB/s`** | **`15.6%` / `31.6%`** | Zero penalty for 256-bit GCM (`>1.84` cores free on 1T). |
-| **`AES-256-GCM` Decrypt** *(`afalgprov`)* | `256 KiB` | 1 | **`31.02 MB/s`** | **`69.7%`** | Full hardware 16-byte tag verification via `readv()`. |
+| **`AES-128-GCM` Encrypt** *(`afalgprov`)* | `256 KiB` | 1 / 4 | **`31.53` / `32.54 MB/s`** | **`16.2%` / `33.3%`** | **2.47×** faster, **6.1×** lower CPU load (`SPACC + ghash-ce`). |
+| **`AES-128-GCM` Decrypt** *(`afalgprov`)* | `256 KiB` | 4 (`-multi 4`) | **`52.03 MB/s`** | **`127.8%`** | Parallel NEON `GHASH` + SPACC `CTR` overlap (**4.08×** vs SW). |
+| **`AES-256-GCM` Encrypt** *(`afalgprov`)* | `256 KiB` | 1 / 4 | **`31.46` / `32.40 MB/s`** | **`15.6%` / `31.6%`** | Zero penalty for 256-bit GCM (`>1.84` cores free on 1T). |
+| **`AES-256-GCM` Decrypt** *(`afalgprov`)* | `256 KiB` | 1 / 4 | **`31.02` / `51.59 MB/s`** | **`69.7%` / `127.6%`** | Full hardware 16-byte tag verification via `readv()`. |
 | **`ChaCha20-Poly1305`** *(NEON `default`)* | `16 KiB` | 2 (`-multi 2`) | **`141.36 MB/s`** | **`197.4%` (both cores)** | Peak TLS 1.3 record throughput (~98.7% per core). |
 | **`ChaCha20-Poly1305`** *(NEON `default`)* | `256 KiB` | 1 / 4 | **`57.83` / `110.19 MB/s`** | **`99.7%` / `196.5%` (both cores)** | Large-block TLS 1.3 / HTTPS AEAD throughput. |
 | **`AES-128-GCM`** *(Unidirectional `kTLS TX`)* | `16 KiB` | 1 | **`11.90 MB/s`** | **`38.3%`** | `CTR` offloaded to SPACC; `GHASH` on CPU (`2.6×` less CPU than pure CPU GCM). |
 
----
+> **Why multi-stream GCM Decrypt (`~52 MB/s`) outpaces Encrypt (`~32.5 MB/s`):** During encryption, `GHASH` depends on the ciphertext output of `CTR` and must wait for the SPACC DMA interrupt (`IRQ 45`) sequentially. During decryption, ciphertext is available upfront, allowing both Cortex-A9 NEON units to compute `GHASH` in parallel while SPACC DMA decrypts `CTR` concurrently.
 
+---
 
 ## Build & Install
 
@@ -100,7 +102,7 @@ grep crypto /proc/interrupts && \
 /usr/bin/time -p openssl speed -elapsed -provider afalgprov -provider default -evp aes-256-ctr -bytes 262144 && \
 grep crypto /proc/interrupts
 
-# 3. Verify AES-256-GCM AEAD hardware offload (1 and 4 threads, 256 KiB blocks)
-/usr/bin/time -p openssl speed -elapsed -provider afalgprov -provider default -evp aes-256-gcm -bytes 262144
+# 3. Verify AES-256-GCM AEAD encrypt & decrypt offload (-multi 4, 256 KiB blocks)
 /usr/bin/time -p openssl speed -elapsed -multi 4 -provider afalgprov -provider default -evp aes-256-gcm -bytes 262144
+/usr/bin/time -p openssl speed -elapsed -multi 4 -provider afalgprov -provider default -evp aes-256-gcm -decrypt -bytes 262144
 ```
