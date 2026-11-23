@@ -30,6 +30,8 @@
 #include <openssl/proverr.h>
 #include <openssl/provider.h>
 
+#include "afalg_gcm.h"
+
 #ifndef SOL_ALG
 #define SOL_ALG 279
 #endif
@@ -1003,8 +1005,15 @@ static const OSSL_ALGORITHM afalg_algorithms[] = {
       aes192ctr_functions, "NXP LS1024A SPACC AES-192-CTR" },
     { "AES-256-CTR:id-aes256-CTR", "provider=afalgprov",
       aes256ctr_functions, "NXP LS1024A SPACC AES-256-CTR" },
+    { "AES-128-GCM:id-aes128-GCM:2.16.840.1.101.3.4.1.6", "provider=afalgprov",
+      afalg_aes128gcm_functions, "NXP LS1024A SPACC AES-128-GCM" },
+    { "AES-192-GCM:id-aes192-GCM:2.16.840.1.101.3.4.1.26", "provider=afalgprov",
+      afalg_aes192gcm_functions, "NXP LS1024A SPACC AES-192-GCM" },
+    { "AES-256-GCM:id-aes256-GCM:2.16.840.1.101.3.4.1.46", "provider=afalgprov",
+      afalg_aes256gcm_functions, "NXP LS1024A SPACC AES-256-GCM" },
     { NULL, NULL, NULL, NULL }
 };
+
 
 /* -------------------------------------------------------------------------
  * Provider entry points
