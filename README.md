@@ -1,4 +1,4 @@
-# afalgprov — OpenSSL 3.5 AF_ALG Provider for NXP LS1024A (SPACC cryptographic engine)
+# afalgprov â€” OpenSSL 3.5 AF_ALG Provider for NXP LS1024A (SPACC cryptographic engine)
 
 A dynamic cryptographic provider for **OpenSSL 3.5** on the **NXP LS1024A** platform (ARM Cortex-A9, `OPENSSL_armcap=0x1`, Debian `arm-linux-gnueabihf`), providing hardware offloading of `AES-CTR` encryption via the Linux kernel **`AF_ALG`** socket interface (`vmsplice`/`splice` pipeline) and the **SPACC (`9b000000.crypto`)** cryptographic engine.
 
@@ -18,14 +18,14 @@ ARM Cortex-A9 processors lack hardware AES cryptographic instructions (ARMv8 Cry
 | **`AES-192-CTR`** (`aes-192-ctr`) | `ctr-aes-ls1024a-spacc` | 192 | Software fallback (`default`) | **Hardware SPACC (`AF_ALG`)** | Streaming channels (192-bit) |
 | **`AES-256-CTR`** (`aes-256-ctr`) | `ctr-aes-ls1024a-spacc` | 256 | Software fallback (`default`) | **Hardware SPACC (`AF_ALG`)** | `OpenSSH` (`aes256-ctr`), `openssl enc` |
 
-*(All other algorithms — `AES-CBC`, `AES-GCM`, `ChaCha20-Poly1305`, `RSA`, `ECDSA`, `Ed25519`, `SHA-256`, etc. — are intentionally excluded from `afalgprov` and handled directly by the `default` provider or Linux kTLS.)*
+*(All other algorithms â€” `AES-CBC`, `AES-GCM`, `ChaCha20-Poly1305`, `RSA`, `ECDSA`, `Ed25519`, `SHA-256`, etc. â€” are intentionally excluded from `afalgprov` and handled directly by the `default` provider or Linux kTLS.)*
 
 ### Key Mechanisms and Design Decisions
 
 - **Zero-Copy `vmsplice` + `splice` Pipeline (`57344`-Byte Page-Aligned Chunks):**
   Instead of copying plaintext through user-space socket buffers on every write, `afalgprov` maps input pages directly into an internal kernel pipe via `vmsplice(..., 0)` and forwards them into the `AF_ALG` operation socket via `splice()` (`SPLICE_F_MORE` for intermediate chunks).
 - **Scatter-Gather Limit Alignment (`AFALG_SPLICE_CHUNK = 57344`):**
-  A `57,344`-byte (`14 ? 4096`) chunk is an exact multiple of 32 bytes (`2 ? AES_BLOCK_SIZE`) and stays strictly below the single-command cap (`SPACC_MAX_CHUNK_BYTES = 65520`). Even when user-space buffers are not page-aligned, 14 data pages span at most **15** scatterlist entries—matching the hardware DDT prefetcher limit (`SPACC_MAX_SG_ENTS = 15`) so each `splice` executes as a single DMA command without splitting or triggering small-tail software fallbacks.
+  A `57,344`-byte (`14 ? 4096`) chunk is an exact multiple of 32 bytes (`2 ? AES_BLOCK_SIZE`) and stays strictly below the single-command cap (`SPACC_MAX_CHUNK_BYTES = 65520`). Even when user-space buffers are not page-aligned, 14 data pages span at most **15** scatterlist entriesâ€”matching the hardware DDT prefetcher limit (`SPACC_MAX_SG_ENTS = 15`) so each `splice` executes as a single DMA command without splitting or triggering small-tail software fallbacks.
 - **Pipe and Socket Buffer Sizing:**
   Both internal pipe capacity (`AFALG_PIPE_SZ`) and socket buffers (`SO_SNDBUF`/`SO_RCVBUF`) are tuned to **224 KiB** (`4 ? 57344` bytes), preventing mid-transfer stalls while remaining well within the default `fs.pipe-max-size` limit.
 - **Configurable Empirical Threshold (`hw-threshold = 8192`) & Heap-Free Hot Path:**
@@ -38,7 +38,7 @@ ARM Cortex-A9 processors lack hardware AES cryptographic instructions (ARMv8 Cry
   1. The NXP LS1024A SPACC kernel driver (`9b000000.crypto`) registers **`ctr(aes)`** (`ctr-aes-ls1024a-spacc`), **not** `gcm(aes)` (`TlsTxDevice` remains `0`).
   2. OpenSSL's streaming `EVP` API (`EVP_CipherUpdate` + separate `OSSL_CIPHER_PARAM_AEAD_TAG`) conflicts with the atomic packet interface of `algif_aead` (`AAD + payload + tag` in a single `sendmsg`), which would require buffering entire packets in user space.
   3. Intermediate Galois Field (`GHASH`) multiplier states cannot be exported/imported between `default` and SPACC DMA during hybrid fallback switching.
-  4. **Recommended Solution — Kernel TLS (`kTLS`):** Enabling `Options = KTLS` in `/etc/ssl/openssl.cnf` (with the Linux `tls` module loaded) lets OpenSSL hand off established TLS 1.3 `AES-128-GCM` / `AES-256-GCM` sockets to the kernel (`SOL_TLS`). Inside the kernel, Linux `tls` (`TlsTxSw` / `TlsRxSw`) computes `GHASH` and delegates the underlying **`ctr(aes)`** payload encryption to the kernel crypto API (`ctr-aes-ls1024a-spacc`, priority `300`), eliminating user/kernel copy overhead, enabling `SSL_sendfile()` zero-copy, and cutting client CPU time by **~74%**.
+  4. **Recommended Solution â€” Kernel TLS (`kTLS`):** Enabling `Options = KTLS` in `/etc/ssl/openssl.cnf` (with the Linux `tls` module loaded) lets OpenSSL hand off established TLS 1.3 `AES-128-GCM` / `AES-256-GCM` sockets to the kernel (`SOL_TLS`). Inside the kernel, Linux `tls` (`TlsTxSw` / `TlsRxSw`) computes `GHASH` and delegates the underlying **`ctr(aes)`** payload encryption to the kernel crypto API (`ctr-aes-ls1024a-spacc`, priority `300`), eliminating user/kernel copy overhead, enabling `SSL_sendfile()` zero-copy, and cutting client CPU time by **~74%**.
   5. For maximum TLS 1.3 throughput on ARMv7 NEON without kTLS, prioritizing `TLS_CHACHA20_POLY1305_SHA256` delivers **60.9 MB/s** vs. **12.9 MB/s** for software `AES-128-GCM` (**4.7x** faster).
 
 ---
@@ -49,22 +49,22 @@ Measured throughput and CPU utilization on the **NXP LS1024A** board (OpenSSL 3.
 
 | Algorithm and Mode | Pure CPU (`OPENSSL_CONF=/dev/null`, `default` only) | Hardware SPACC (`afalgprov`, DMA IRQ 45) | Throughput Gain | CPU Time (`user + sys` over ~3.07s run) | Role in System |
 | :--- | :--- | :--- | :--- | :--- | :--- |
-| **`AES-128-CTR`** | **29.0 MB/s** (`28,989 k`) | **40.5 MB/s** (`40,527 k`) | **+39.8% (1.40x)** | Reduced from **100%** (`3.04s + 0.02s`) to **29.6%** (`0.07s + 0.84s`) — **3.4x less CPU** | `OpenSSH`, `SFTP`, `SCP` (`aes128-ctr`) |
-| **`AES-192-CTR`** | **24.5 MB/s** (`24,473 k`) | **40.4 MB/s** (`40,392 k`) | **+65.0% (1.65x)** | Reduced from **100%** (`3.04s + 0.02s`) to **32.6%** (`0.09s + 0.91s`) — **3.1x less CPU** | Streaming channels (192-bit) |
-| **`AES-256-CTR`** | **21.3 MB/s** (`21,256 k`) | **40.2 MB/s** (`40,152 k`) | **+88.9% (1.89x)** | Reduced from **100%** (`3.04s + 0.02s`) to **27.7%** (`0.10s + 0.75s`) — **3.6x less CPU** | `OpenSSH` (`aes256-ctr`), `openssl enc` |
+| **`AES-128-CTR`** | **29.0 MB/s** (`28,989 k`) | **40.5 MB/s** (`40,527 k`) | **+39.8% (1.40x)** | Reduced from **100%** (`3.04s + 0.02s`) to **29.6%** (`0.07s + 0.84s`) â€” **3.4x less CPU** | `OpenSSH`, `SFTP`, `SCP` (`aes128-ctr`) |
+| **`AES-192-CTR`** | **24.5 MB/s** (`24,473 k`) | **40.4 MB/s** (`40,392 k`) | **+65.0% (1.65x)** | Reduced from **100%** (`3.04s + 0.02s`) to **32.6%** (`0.09s + 0.91s`) â€” **3.1x less CPU** | Streaming channels (192-bit) |
+| **`AES-256-CTR`** | **21.3 MB/s** (`21,256 k`) | **40.2 MB/s** (`40,152 k`) | **+88.9% (1.89x)** | Reduced from **100%** (`3.04s + 0.02s`) to **27.7%** (`0.10s + 0.75s`) â€” **3.6x less CPU** | `OpenSSH` (`aes256-ctr`), `openssl enc` |
 | **`ChaCha20-Poly1305`** | **60.9 MB/s** (`60,861 k`) | *Not supported by SPACC* | Fastest AEAD on CPU | ~100% of 1 CPU core (ARMv7 NEON) | Primary cipher for TLS 1.3 / HTTPS |
 | **`AES-128-GCM`** | **12.9 MB/s** (`12,867 k`) | *Offloaded to Kernel via `kTLS` (`ctr(aes)`)* | **-73.9% CPU** via kTLS | Client CPU cut from `13.28s` to `3.47s` (128 MiB TLS 1.3 transfer) | TLS 1.3 compatibility (`Options = KTLS`) |
 
-#### TLS 1.3 `AES-128-GCM` Loopback Benchmark (128 MiB Transfer, 64 KiB Chunks)
+#### TLS 1.3 `TLS_AES_256_GCM_SHA384` Loopback Benchmark (128 MiB Transfer, 64 KiB Chunks)
 
-| TLS 1.3 Configuration | kTLS State (`TX / RX`) | Loopback Throughput | Transfer Time | Client CPU Time (`user + sys`) |
+| TLS 1.3 Configuration | kTLS State (`TX / RX`) | Loopback Throughput | Transfer Time | Process CPU Time (`user + sys`, client + server) |
 | :--- | :--- | :--- | :--- | :--- |
-| **User-Space OpenSSL (`kTLS OFF`)** | `0 / 0` | 9.20 MB/s | 13.91 s | **13.28 s** (`12.37s user + 0.91s sys`) |
-| **Kernel TLS (`Options = KTLS`)** | `2 / 2` (`TlsTxSw`/`TlsRxSw` > `ctr(aes)`) | **9.84 MB/s** (+7.0%) | **13.01 s** | **3.47 s** (`1.17s user + 2.30s sys` — **-73.9% CPU**) |
+| **User-Space OpenSSL (`kTLS OFF`)** | `0 / 0` (`+0` SPACC IRQs) | 8.31 MB/s | 15.41 s | **29.28 s** (~190% across 2 cores) |
+| **Kernel TLS (`Options = KTLS`)** | `2 / 2` (`TlsTxSw`/`TlsRxSw` â†’ `ctr(aes)`, `+16,306` SPACC IRQs) | **10.07 MB/s** (+21.2%) | **12.72 s** | **9.98 s** (**-65.9% CPU** â€” **2.93x less CPU**) |
 
 ### Key Takeaways from Benchmarks
-1. **Constant ~40.2–40.5 MB/s Hardware Ceiling Across All Key Lengths (128/192/256-bit):**
-   While software `AES-CTR` slows down significantly as key length increases from 128 to 256 bits (`29.0 > 21.3 MB/s`), SPACC DMA maintains a flat **40.2–40.5 MB/s** across all key sizes—delivering **1.89x throughput** on `AES-256-CTR` while cutting user-space CPU time from **3.04s down to 0.07–0.10s** (~70% total CPU offload).
+1. **Constant ~40.2â€“40.5 MB/s Hardware Ceiling Across All Key Lengths (128/192/256-bit):**
+   While software `AES-CTR` slows down significantly as key length increases from 128 to 256 bits (`29.0 > 21.3 MB/s`), SPACC DMA maintains a flat **40.2â€“40.5 MB/s** across all key sizesâ€”delivering **1.89x throughput** on `AES-256-CTR` while cutting user-space CPU time from **3.04s down to 0.07â€“0.10s** (~70% total CPU offload).
 2. **Verified 1:1 Hardware Offload Ratio:**
    Across the 3 benchmark runs (`1,849 + 1,849 + 1,838 = 5,536` 64 KiB ops, each split into `57,344 + 8,192` bytes = `11,072` hardware chunks), the `9b000000.crypto` interrupt counter (IRQ 45) incremented by **`+11,072`** (`57,890 > 68,962`), confirming zero software fallback on large aligned buffers.
 3. **Optimal System-Wide Split (`afalgprov` + `kTLS` + `ChaCha20-Poly1305`):**
