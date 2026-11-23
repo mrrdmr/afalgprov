@@ -1,52 +1,82 @@
-# afalgprov v3.4 — High-Throughput OpenSSL 3.x AF_ALG Provider for NXP LS1024A
+# afalgprov v3.4 — OpenSSL 3.x AF_ALG Provider for NXP LS1024A
 
-`afalgprov` is a zero-copy-inspired, low-overhead OpenSSL 3.5+ `EVP_CIPHER` provider engineered specifically for the **NXP LS1024A** (Dual-core ARM Cortex-A9) hardware cryptographic accelerator (`ctr-aes-ls1024a-spacc` via SPACC DMA).
+High-throughput OpenSSL 3.5+ `EVP_CIPHER` provider for the **NXP LS1024A** (Dual-core ARM Cortex-A9) hardware SPACC DMA engine (`ctr-aes-ls1024a-spacc`).
 
-By replacing legacy `pipe` / `vmsplice` / `splice` chains with direct `sendmsg()` scatter-gather I/O (`struct iovec` chunks up to **56 KiB**), `afalgprov` v3.4 minimizes syscall frequency, DMA descriptor setup overhead, and `IRQ 45` (`crypto`) interrupt rates while reducing CPU usage by **60–70%** compared to software AES.
-
----
-
-## 1. Architecture Overview
-
-| Component | Implementation | Purpose |
-| :--- | :--- | :--- |
-| **Algorithm Offload** | `AES-128-CTR`, `AES-256-CTR` | Delegated to `ctr-aes-ls1024a-spacc` (SPACC DMA engine). |
-| **I/O Transport** | Direct `sendmsg()` (`msg_iov`) | Eliminates pipe creation (`pipe2`), `vmsplice`, and extra kernel page copies. |
-| **Chunking Strategy** | 56 KiB (`57344` bytes) max per `sendmsg()` | Fits cleanly within default socket `SNDBUF` limits while maximizing DMA burst efficiency. |
-| **AEAD / TLS 1.3 Strategy** | Hybrid (`ChaCha20-Poly1305` NEON + `kTLS` `AES-GCM`) | Uses ARMv7 NEON for maximum TLS throughput and Linux `kTLS` + SPACC `CTR` for `AES-GCM` CPU offload. |
+## Key Architecture Highlights
+* **Hardware Offload:** `AES-128-CTR` and `AES-256-CTR` via Linux `AF_ALG` (`ctr-aes-ls1024a-spacc`).
+* **Direct `sendmsg()` I/O:** Uses scatter-gather `msg_iov` chunks up to **56 KiB** (`57344` bytes), eliminating `pipe`/`vmsplice` syscalls and extra page copies.
+* **TLS 1.3 Pairing:** Designed to run alongside OpenSSL's `default` provider (`ChaCha20-Poly1305` via ARMv7 NEON) and Linux `kTLS` (`AES-GCM` CTR offload).
 
 ---
 
-## 2. Benchmark Results (NXP LS1024A, Linux 6.18, OpenSSL 3.5)
+## Core Benchmarks (NXP LS1024A, Linux 6.18, OpenSSL 3.5)
 
-### A. Stream Cipher Throughput (`AES-128-CTR` / `AES-256-CTR`, 64 KiB blocks)
-
-| Mode | Threads | Throughput | Wall Time | Total CPU (`user+sys`) | Dual-Core CPU Load |
-| :--- | :---: | :---: | :---: | :---: | :---: |
-| **Pure CPU (Software)** | 1 | `29.40 MB/s` | `3.00s` | `3.00s` | `50.0%` (1 core 100%) |
-| **`afalgprov` v3.4 (SPACC)** | 1 | **`42.20 MB/s`** | `3.00s` | **`0.88s`** | **`14.7%`** (**-71% CPU**) |
-| **`afalgprov` v3.4 (SPACC)** | 2 (`-multi 2`) | **`57.65 MB/s`** | `3.10s` | **`1.68s`** | **`27.1%`** |
-| **`afalgprov` v3.4 (SPACC)** | 4 (`-multi 4`) | **`64.30 MB/s`** | `3.10s` | **`2.32s`** | **`37.4%`** |
-
-### B. TLS 1.3 AEAD Performance: `ChaCha20-Poly1305` (NEON) vs. Kernel `kTLS` (`AES-GCM`)
-
-| Cipher Suite / Backend | Block Size | Threads | Throughput | Dual-Core CPU Load | Notes |
+| Cipher / Mode | Block | Threads | Throughput | Dual-Core CPU | Role |
 | :--- | :---: | :---: | :---: | :---: | :--- |
-| **`TLS_CHACHA20_POLY1305_SHA256`** *(Pure CPU NEON)* | `16 KiB` | 2 (`-multi 2`) | **`141.36 MB/s`** | `98.7%` (`6.08s / 3.08s`) | Optimal for TLS 1.3 / HTTPS / WireGuard on Cortex-A9. |
-| **`TLS_CHACHA20_POLY1305_SHA256`** *(Pure CPU NEON)* | `64 KiB` | 2 (`-multi 2`) | **`120.53 MB/s`** | `98.7%` (`6.08s / 3.08s`) | High-speed bulk AEAD across both Cortex-A9 cores. |
-| **`TLS_CHACHA20_POLY1305_SHA256`** *(Pure CPU NEON)* | `16 KiB` | 4 (`-multi 4`) | **`138.81 MB/s`** | `98.7%` (`6.12s / 3.10s`) | Scales smoothly under concurrent connections. |
-| **Kernel `gcm(aes)` (`AF_ALG` raw)** | `16 KiB` | 1 | `15.53 MB/s` | `15.0%` (`0.62s / 2.06s`) | Hybrid `gcm_base(ctr-aes-ls1024a-spacc, ghash-generic)`. |
-| **`TLS_AES_128_GCM_SHA256`** *(Unidirectional `kTLS TX` `SSL_sendfile`)* | `16 KiB` | 1 | **`11.90 MB/s`** | **`19.2%`** (`8.25s / 21.52s`) | Offloads `CTR` to SPACC; saves ~65% CPU vs software GCM. |
-| **`TLS_AES_256_GCM_SHA384`** *(Unidirectional `kTLS TX` `SSL_sendfile`)* | `16 KiB` | 1 | **`11.06 MB/s`** | **`20.5%`** (`9.52s / 23.15s`) | Identical hardware throughput regardless of AES key length. |
-
-> **Why `kTLS` `AES-GCM` tops out at ~11.9 MB/s per stream on LS1024A:**
-> ARM Cortex-A9 (ARMv7-A) lacks ARMv8 `PMULL` carryless multiplication instructions, so the authentication tag (`GHASH`) runs in software (`ghash-generic`), while `ctr(aes)` is dispatched to SPACC per 16 KiB TLS record (`+32,768` SPACC IRQs per 256 MiB). Prioritizing `ChaCha20-Poly1305` for TLS 1.3 unlocks up to **141 MB/s** via NEON, while `Options = KTLS` offloads `AES-GCM` clients with minimal CPU overhead.
+| **`AES-128/256-CTR`** *(Pure CPU)* | `64 KiB` | 1 | `29.40 MB/s` | `50.0%` | Baseline software AES. |
+| **`AES-128/256-CTR`** *(`afalgprov` v3.4)* | `64 KiB` | 1 | **`42.20 MB/s`** | **`14.7%`** | **-71% CPU** vs software AES. |
+| **`AES-128/256-CTR`** *(`afalgprov` v3.4)* | `64 KiB` | 2 (`-multi 2`) | **`57.65 MB/s`** | **`27.1%`** | Multi-stream SSH/SFTP/bulk transfer. |
+| **`AES-128/256-CTR`** *(`afalgprov` v3.4)* | `64 KiB` | 4 (`-multi 4`) | **`64.30 MB/s`** | **`37.4%`** | Peak hardware SPACC throughput. |
+| **`ChaCha20-Poly1305`** *(NEON `default`)* | `16 KiB` | 2 (`-multi 2`) | **`141.36 MB/s`** | `98.7%` | Optimal TLS 1.3 / HTTPS AEAD cipher. |
+| **`AES-128-GCM`** *(Unidirectional `kTLS TX`)* | `16 KiB` | 1 | **`11.90 MB/s`** | **`19.2%`** | `CTR` offloaded to SPACC; `GHASH` on CPU. |
 
 ---
 
-## 3. Build & Installation
+## Build & Install
 
-### Build `afalgprov.so`
 ```bash
 gcc -O3 -march=armv7-a -mfpu=neon -mfloat-abi=hard -fPIC -shared \
     afalgprov.c -o afalgprov.so -lcrypto
+
+MODULES_DIR=$(openssl version -m | awk -F'"' '{print $2}')
+install -m 0755 afalgprov.so "$MODULES_DIR/afalgprov.so"
+
+modprobe tls
+echo "tls" > /etc/modules-load.d/tls.conf
+```
+
+---
+
+## Configuration (`/etc/ssl/openssl.cnf`)
+
+```ini
+openssl_conf = openssl_init
+
+[openssl_init]
+providers = provider_sect
+ssl_conf = ssl_sect
+
+[provider_sect]
+afalgprov = afalgprov_sect
+default = default_sect
+
+[afalgprov_sect]
+activate = 1
+
+[default_sect]
+activate = 1
+
+[ssl_sect]
+system_default = ssl_default_sect
+
+[ssl_default_sect]
+Options = KTLS
+Ciphersuites = TLS_CHACHA20_POLY1305_SHA256:TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384
+```
+
+---
+
+## 5. Verification
+
+```bash
+# 1. Confirm afalgprov and default are both active
+openssl list -providers
+
+# 2. Verify AES-128-CTR hardware offload and IRQ 45 (crypto) increments
+grep crypto /proc/interrupts && \
+/usr/bin/time -p openssl speed -elapsed -provider afalgprov -provider default -evp aes-128-ctr -bytes 65536 && \
+grep crypto /proc/interrupts
+
+# 3. Verify multi-core throughput (-multi 4)
+/usr/bin/time -p openssl speed -elapsed -multi 4 -provider afalgprov -provider default -evp aes-128-ctr -bytes 65536
+```
