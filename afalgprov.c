@@ -44,7 +44,7 @@
  */
 #define SPACC_HW_THRESHOLD  16384U
 #define AFALG_SPLICE_CHUNK  57344U
-#define AFALG_PIPE_SZ       (4U * AFALG_SPLICE_CHUNK)
+#define AFALG_PIPE_SZ       (2U * AFALG_SPLICE_CHUNK)
 
 #define AES_BLOCK_SZ        16U
 #define AES_IV_SZ           16U
