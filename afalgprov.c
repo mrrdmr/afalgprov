@@ -1,11 +1,10 @@
 /*
  * afalgprov.c - OpenSSL 3.5 AF_ALG Zero-Copy Provider for NXP LS1024A (SPACC DMA)
  *
- * Offloads aligned streaming AES-128/192/256 (CTR and CBC) buffers >= 8192 bytes
- * to the Linux kernel AF_ALG interface via a zero-copy vmsplice + splice pipeline
- * (57344-byte chunks = 14 pages, fitting within SPACC's 16-entry DDT hardware
- * limit even for unaligned user buffers), with transparent fallback to OpenSSL's
- * default provider for small buffers, unaligned tails, and padded CBC decryption.
+ * Offloads streaming AES-128/192/256-CTR buffers >= 8192 bytes to the Linux
+ * kernel AF_ALG interface via a zero-copy vmsplice + splice pipeline
+ * (57344-byte chunks, <= 15 SG pages per command), with transparent fallback
+ * to OpenSSL's default provider for small buffers and unaligned tails.
  */
 
 #define _GNU_SOURCE
@@ -36,15 +35,10 @@
 #define SOL_ALG 279
 #endif
 
-/*
- * Tuned for NXP LS1024A SPACC (9b000000.crypto):
- * Hardware DDT prefetcher stops at 16 entries (15 data + 1 terminator).
- * 14 * 4096 = 57344 bytes spans at most 15 physical pages even when unaligned,
- * avoiding DDT splits while remaining a multiple of both 4096 and AES_BLOCK_SZ.
- */
-#define SPACC_HW_THRESHOLD  16384U
+/* Tuned for NXP LS1024A SPACC (SPACC_MIN_HW_BYTES=8192, SPACC_MAX_SG_ENTS=15) */
+#define SPACC_HW_THRESHOLD  8192U
 #define AFALG_SPLICE_CHUNK  57344U
-#define AFALG_PIPE_SZ       (2U * AFALG_SPLICE_CHUNK)
+#define AFALG_PIPE_SZ       (4U * AFALG_SPLICE_CHUNK)
 
 #define AES_BLOCK_SZ        16U
 #define AES_IV_SZ           16U
@@ -63,7 +57,6 @@ typedef struct {
 
 typedef struct {
     OSSL_LIB_CTX *libctx;
-    OSSL_PROVIDER *default_prov;
     size_t hw_threshold;
 } AFALG_PROV_CTX;
 
@@ -101,12 +94,9 @@ typedef struct {
 } AFALG_CTX;
 
 static const AFALG_CIPHER_INFO cipher_table[] = {
-    { "AES-128-CTR", "ctr-aes-ls1024a-spacc", 16, AES_IV_SZ, 1,            1 },
-    { "AES-192-CTR", "ctr-aes-ls1024a-spacc", 24, AES_IV_SZ, 1,            1 },
-    { "AES-256-CTR", "ctr-aes-ls1024a-spacc", 32, AES_IV_SZ, 1,            1 },
-    { "AES-128-CBC", "cbc-aes-ls1024a-spacc", 16, AES_IV_SZ, AES_BLOCK_SZ, 0 },
-    { "AES-192-CBC", "cbc-aes-ls1024a-spacc", 24, AES_IV_SZ, AES_BLOCK_SZ, 0 },
-    { "AES-256-CBC", "cbc-aes-ls1024a-spacc", 32, AES_IV_SZ, AES_BLOCK_SZ, 0 },
+    { "AES-128-CTR", "ctr-aes-ls1024a-spacc", 16, AES_IV_SZ, 1, 1 },
+    { "AES-192-CTR", "ctr-aes-ls1024a-spacc", 24, AES_IV_SZ, 1, 1 },
+    { "AES-256-CTR", "ctr-aes-ls1024a-spacc", 32, AES_IV_SZ, 1, 1 },
 };
 
 /* -------------------------------------------------------------------------
@@ -327,7 +317,6 @@ static int afalg_hw_zero_copy(AFALG_CTX *ctx,
     memcpy(alg_iv->iv, ctx->iv, iv_len);
 
     /* Send operation & IV control header for this hardware request */
-
     for (;;) {
         ssize_t ret = sendmsg(ctx->opfd, &msg, MSG_MORE);
         if (ret >= 0)
@@ -1050,29 +1039,20 @@ static const OSSL_PARAM *afalg_settable_ctx_params(void *vctx, void *provctx)
           (void (*)(void))afalg_set_ctx_params },                             \
         { OSSL_FUNC_CIPHER_SETTABLE_CTX_PARAMS,                               \
           (void (*)(void))afalg_settable_ctx_params },                        \
-        OSSL_DISPATCH_END                                                     \
-    }
+        { 0, NULL }                                                           \
+    };
 
-IMPLEMENT_AFALG_CIPHER(afalg_aes_128_ctr, 0);
-IMPLEMENT_AFALG_CIPHER(afalg_aes_192_ctr, 1);
-IMPLEMENT_AFALG_CIPHER(afalg_aes_256_ctr, 2);
-IMPLEMENT_AFALG_CIPHER(afalg_aes_128_cbc, 3);
-IMPLEMENT_AFALG_CIPHER(afalg_aes_192_cbc, 4);
-IMPLEMENT_AFALG_CIPHER(afalg_aes_256_cbc, 5);
+IMPLEMENT_AFALG_CIPHER(aes128ctr, 0)
+IMPLEMENT_AFALG_CIPHER(aes192ctr, 1)
+IMPLEMENT_AFALG_CIPHER(aes256ctr, 2)
 
-static const OSSL_ALGORITHM afalg_ciphers[] = {
-    { "AES-128-CTR:aes-128-ctr", "provider=afalgprov", afalg_aes_128_ctr_functions,
-      "NXP LS1024A SPACC AF_ALG AES-128-CTR" },
-    { "AES-192-CTR:aes-192-ctr", "provider=afalgprov", afalg_aes_192_ctr_functions,
-      "NXP LS1024A SPACC AF_ALG AES-192-CTR" },
-    { "AES-256-CTR:aes-256-ctr", "provider=afalgprov", afalg_aes_256_ctr_functions,
-      "NXP LS1024A SPACC AF_ALG AES-256-CTR" },
-    { "AES-128-CBC:aes-128-cbc:2.16.840.1.101.3.4.1.2", "provider=afalgprov", afalg_aes_128_cbc_functions,
-      "NXP LS1024A SPACC AF_ALG AES-128-CBC" },
-    { "AES-192-CBC:aes-192-cbc:2.16.840.1.101.3.4.1.22", "provider=afalgprov", afalg_aes_192_cbc_functions,
-      "NXP LS1024A SPACC AF_ALG AES-192-CBC" },
-    { "AES-256-CBC:aes-256-cbc:2.16.840.1.101.3.4.1.42", "provider=afalgprov", afalg_aes_256_cbc_functions,
-      "NXP LS1024A SPACC AF_ALG AES-256-CBC" },
+static const OSSL_ALGORITHM afalg_algorithms[] = {
+    { "AES-128-CTR:id-aes128-CTR", "provider=afalgprov",
+      aes128ctr_functions, "LS1024A SPACC AES-128-CTR" },
+    { "AES-192-CTR:id-aes192-CTR", "provider=afalgprov",
+      aes192ctr_functions, "LS1024A SPACC AES-192-CTR" },
+    { "AES-256-CTR:id-aes256-CTR", "provider=afalgprov",
+      aes256ctr_functions, "LS1024A SPACC AES-256-CTR" },
     { NULL, NULL, NULL, NULL }
 };
 
@@ -1080,47 +1060,39 @@ static const OSSL_ALGORITHM afalg_ciphers[] = {
  * Provider entry points
  * ------------------------------------------------------------------------- */
 
-static const OSSL_PARAM afalg_param_types[] = {
-    OSSL_PARAM_DEFN(OSSL_PROV_PARAM_NAME, OSSL_PARAM_UTF8_PTR, NULL, 0),
-    OSSL_PARAM_DEFN(OSSL_PROV_PARAM_VERSION, OSSL_PARAM_UTF8_PTR, NULL, 0),
-    OSSL_PARAM_DEFN(OSSL_PROV_PARAM_BUILDINFO, OSSL_PARAM_UTF8_PTR, NULL, 0),
-    OSSL_PARAM_DEFN(OSSL_PROV_PARAM_STATUS, OSSL_PARAM_INTEGER, NULL, 0),
+static const OSSL_PARAM afalg_prov_gettable_params_list[] = {
+    OSSL_PARAM_utf8_ptr(OSSL_PROV_PARAM_NAME, NULL, 0),
+    OSSL_PARAM_utf8_ptr(OSSL_PROV_PARAM_VERSION, NULL, 0),
+    OSSL_PARAM_utf8_ptr(OSSL_PROV_PARAM_BUILDINFO, NULL, 0),
+    OSSL_PARAM_int(OSSL_PROV_PARAM_STATUS, NULL),
     OSSL_PARAM_size_t(AFALG_PROV_PARAM_HW_THRESHOLD, NULL),
     OSSL_PARAM_END
 };
 
-static const OSSL_PARAM *afalg_gettable_prov_params(void *provctx)
+static const OSSL_PARAM *afalg_prov_gettable_params(void *provctx)
 {
     (void)provctx;
-    return afalg_param_types;
+    return afalg_prov_gettable_params_list;
 }
 
-static int afalg_set_prov_str(OSSL_PARAM *p, const char *val)
-{
-    if (p == NULL)
-        return 1;
-    if (p->data_type == OSSL_PARAM_UTF8_PTR)
-        return OSSL_PARAM_set_utf8_ptr(p, val);
-    if (p->data_type == OSSL_PARAM_UTF8_STRING)
-        return OSSL_PARAM_set_utf8_string(p, val);
-    return 1;
-}
-
-static int afalg_get_prov_params(void *provctx, OSSL_PARAM params[])
+static int afalg_prov_get_params(void *provctx, OSSL_PARAM params[])
 {
     AFALG_PROV_CTX *pctx = (AFALG_PROV_CTX *)provctx;
     OSSL_PARAM *p;
 
+    if (pctx == NULL)
+        return 0;
+
     p = OSSL_PARAM_locate(params, OSSL_PROV_PARAM_NAME);
-    if (!afalg_set_prov_str(p, "NXP LS1024A AF_ALG SPACC Provider"))
+    if (p != NULL && !OSSL_PARAM_set_utf8_ptr(p, "LS1024A SPACC AF_ALG Provider"))
         return 0;
 
     p = OSSL_PARAM_locate(params, OSSL_PROV_PARAM_VERSION);
-    if (!afalg_set_prov_str(p, "3.2.1"))
+    if (p != NULL && !OSSL_PARAM_set_utf8_ptr(p, "1.1.0"))
         return 0;
 
     p = OSSL_PARAM_locate(params, OSSL_PROV_PARAM_BUILDINFO);
-    if (!afalg_set_prov_str(p, "OpenSSL 3.5 AF_ALG Zero-Copy vmsplice/splice"))
+    if (p != NULL && !OSSL_PARAM_set_utf8_ptr(p, OPENSSL_FULL_VERSION_STR))
         return 0;
 
     p = OSSL_PARAM_locate(params, OSSL_PROV_PARAM_STATUS);
@@ -1128,49 +1100,37 @@ static int afalg_get_prov_params(void *provctx, OSSL_PARAM params[])
         return 0;
 
     p = OSSL_PARAM_locate(params, AFALG_PROV_PARAM_HW_THRESHOLD);
-    if (p != NULL && pctx != NULL &&
-        !OSSL_PARAM_set_size_t(p, pctx->hw_threshold))
+    if (p != NULL && !OSSL_PARAM_set_size_t(p, pctx->hw_threshold))
         return 0;
 
     return 1;
 }
 
-static const OSSL_ALGORITHM *afalg_query_operation(void *provctx,
-                                                   int operation_id,
-                                                   int *no_cache)
+static const OSSL_ALGORITHM *afalg_query(void *provctx,
+                                         int operation_id,
+                                         int *no_cache)
 {
     (void)provctx;
     *no_cache = 0;
 
     if (operation_id == OSSL_OP_CIPHER)
-        return afalg_ciphers;
+        return afalg_algorithms;
 
     return NULL;
 }
 
 static void afalg_teardown(void *provctx)
 {
-    AFALG_PROV_CTX *pctx = (AFALG_PROV_CTX *)provctx;
-    if (pctx == NULL)
-        return;
-
-    if (pctx->default_prov != NULL) {
-        OSSL_PROVIDER_unload(pctx->default_prov);
-        pctx->default_prov = NULL;
-    }
-    if (pctx->libctx != NULL) {
-        OSSL_LIB_CTX_free(pctx->libctx);
-        pctx->libctx = NULL;
-    }
-    OPENSSL_free(pctx);
+    OPENSSL_free(provctx);
 }
 
-static const OSSL_DISPATCH afalg_dispatch_table[] = {
+static const OSSL_DISPATCH afalg_prov_functions[] = {
     { OSSL_FUNC_PROVIDER_TEARDOWN, (void (*)(void))afalg_teardown },
-    { OSSL_FUNC_PROVIDER_GETTABLE_PARAMS, (void (*)(void))afalg_gettable_prov_params },
-    { OSSL_FUNC_PROVIDER_GET_PARAMS, (void (*)(void))afalg_get_prov_params },
-    { OSSL_FUNC_PROVIDER_QUERY_OPERATION, (void (*)(void))afalg_query_operation },
-    OSSL_DISPATCH_END
+    { OSSL_FUNC_PROVIDER_GETTABLE_PARAMS,
+      (void (*)(void))afalg_prov_gettable_params },
+    { OSSL_FUNC_PROVIDER_GET_PARAMS, (void (*)(void))afalg_prov_get_params },
+    { OSSL_FUNC_PROVIDER_QUERY_OPERATION, (void (*)(void))afalg_query },
+    { 0, NULL }
 };
 
 int OSSL_provider_init(const OSSL_CORE_HANDLE *handle,
@@ -1178,60 +1138,52 @@ int OSSL_provider_init(const OSSL_CORE_HANDLE *handle,
                        const OSSL_DISPATCH **out,
                        void **provctx)
 {
-    AFALG_PROV_CTX *pctx = OPENSSL_zalloc(sizeof(*pctx));
+    AFALG_PROV_CTX *pctx;
+    OSSL_FUNC_core_get_libctx_fn *c_get_libctx = NULL;
     OSSL_FUNC_core_get_params_fn *c_get_params = NULL;
-    const OSSL_DISPATCH *iter;
-    const char *env_thresh;
 
-    if (pctx == NULL)
-        return 0;
-
-    for (iter = in; iter != NULL && iter->function_id != 0; iter++) {
-        if (iter->function_id == OSSL_FUNC_CORE_GET_PARAMS) {
-            c_get_params = OSSL_FUNC_core_get_params(iter);
+    for (; in->function_id != 0; in++) {
+        switch (in->function_id) {
+        case OSSL_FUNC_CORE_GET_LIBCTX:
+            c_get_libctx = OSSL_FUNC_core_get_libctx(in);
+            break;
+        case OSSL_FUNC_CORE_GET_PARAMS:
+            c_get_params = OSSL_FUNC_core_get_params(in);
+            break;
+        default:
             break;
         }
     }
 
-    pctx->libctx = OSSL_LIB_CTX_new_from_dispatch(handle, in);
-    if (pctx->libctx == NULL) {
-        OPENSSL_free(pctx);
+    if (c_get_libctx == NULL)
         return 0;
-    }
 
-    /* Hold an explicit reference to "default" so it cannot be unloaded under us */
-    pctx->default_prov = OSSL_PROVIDER_load(pctx->libctx, "default");
-    if (pctx->default_prov == NULL) {
-        OSSL_LIB_CTX_free(pctx->libctx);
-        OPENSSL_free(pctx);
+    pctx = OPENSSL_zalloc(sizeof(*pctx));
+    if (pctx == NULL)
         return 0;
-    }
 
+    pctx->libctx = (OSSL_LIB_CTX *)c_get_libctx(handle);
     pctx->hw_threshold = SPACC_HW_THRESHOLD;
 
-    /* Read optional "hw-threshold" from openssl.cnf provider section */
     if (c_get_params != NULL) {
-        const char *cfg_thresh = NULL;
+        char *thresh_str = NULL;
         OSSL_PARAM core_params[] = {
-            OSSL_PARAM_utf8_ptr(AFALG_PROV_PARAM_HW_THRESHOLD, &cfg_thresh, 0),
+            OSSL_PARAM_utf8_ptr(AFALG_PROV_PARAM_HW_THRESHOLD, &thresh_str, 0),
             OSSL_PARAM_END
         };
-        if (c_get_params(handle, core_params) && cfg_thresh != NULL) {
-            char *end = NULL;
-            unsigned long val = strtoul(cfg_thresh, &end, 10);
-            if (end != cfg_thresh && *end == '\0' && val >= AES_BLOCK_SZ)
+
+        if (c_get_params(handle, core_params) && thresh_str != NULL) {
+            char *endp = NULL;
+            unsigned long long val = strtoull(thresh_str, &endp, 0);
+
+            if (endp != thresh_str && *endp == '\0' &&
+                val >= SPACC_HW_THRESHOLD && val <= SIZE_MAX) {
                 pctx->hw_threshold = (size_t)val;
+            }
         }
     }
 
-    env_thresh = getenv("AFALG_HW_THRESHOLD");
-    if (env_thresh != NULL && *env_thresh != '\0') {
-        char *end = NULL;
-        unsigned long val = strtoul(env_thresh, &end, 10);
-        if (end != env_thresh && *end == '\0' && val >= AES_BLOCK_SZ)
-            pctx->hw_threshold = (size_t)val;
-    }
+    *out = afalg_prov_functions;
     *provctx = pctx;
-    *out = afalg_dispatch_table;
     return 1;
 }
