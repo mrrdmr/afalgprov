@@ -1,15 +1,14 @@
 /*
- * afalgprov.c - OpenSSL 3.5 AF_ALG Zero-Copy Provider for NXP LS1024A (SPACC DMA)
+ * afalgprov.c - OpenSSL 3.5 AF_ALG Direct-sendmsg Provider for NXP LS1024A (SPACC DMA)
  *
  * Offloads streaming AES-128/192/256-CTR buffers >= 8192 bytes to the Linux
- * kernel AF_ALG interface via a zero-copy vmsplice + splice pipeline
- * (57344-byte chunks, <= 15 SG pages per command), with transparent fallback
+ * kernel AF_ALG interface via single-syscall sendmsg() (msg_iov + msg_control)
+ * in 57344-byte chunks (<= 15 SG pages per command), with transparent fallback
  * to OpenSSL's default provider for small buffers and unaligned tails.
  */
 
 #define _GNU_SOURCE
 #include <errno.h>
-#include <fcntl.h>
 #include <limits.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -37,8 +36,8 @@
 
 /* Tuned for NXP LS1024A SPACC (SPACC_MIN_HW_BYTES=8192, SPACC_MAX_SG_ENTS=15) */
 #define SPACC_HW_THRESHOLD  8192U
-#define AFALG_SPLICE_CHUNK  57344U
-#define AFALG_PIPE_SZ       (4U * AFALG_SPLICE_CHUNK)
+#define AFALG_SEND_CHUNK    57344U
+#define AFALG_SOCK_BUF_SZ   (4U * AFALG_SEND_CHUNK)
 
 #define AES_BLOCK_SZ        16U
 #define AES_IV_SZ           16U
@@ -65,10 +64,9 @@ typedef struct {
     OSSL_LIB_CTX *libctx;
     size_t hw_threshold;
 
-    /* Kernel AF_ALG & pipe descriptors (lazily initialized) */
+    /* Kernel AF_ALG descriptors (lazily initialized, no pipe FDs) */
     int tfmfd;
     int opfd;
-    int pipe_fds[2];
 
     /* Pre-allocated CMSG control buffer (heap-free hot path) */
     uint8_t *cbuf;
@@ -161,25 +159,17 @@ static void afalg_reset_hw_descriptors(AFALG_CTX *ctx)
         close(ctx->tfmfd);
         ctx->tfmfd = -1;
     }
-    if (ctx->pipe_fds[0] >= 0) {
-        close(ctx->pipe_fds[0]);
-        ctx->pipe_fds[0] = -1;
-    }
-    if (ctx->pipe_fds[1] >= 0) {
-        close(ctx->pipe_fds[1]);
-        ctx->pipe_fds[1] = -1;
-    }
 }
 
 static int afalg_ensure_hw(AFALG_CTX *ctx)
 {
     struct sockaddr_alg sa;
-    int sockbuf = (int)AFALG_PIPE_SZ;
+    int sockbuf = (int)AFALG_SOCK_BUF_SZ;
 
     if (!ctx->key_set)
         return 0;
 
-    if (ctx->opfd >= 0 && ctx->pipe_fds[0] >= 0 && ctx->pipe_fds[1] >= 0)
+    if (ctx->opfd >= 0)
         return 1;
 
     afalg_reset_hw_descriptors(ctx);
@@ -204,11 +194,7 @@ static int afalg_ensure_hw(AFALG_CTX *ctx)
     if (ctx->opfd < 0)
         goto err;
 
-    if (pipe2(ctx->pipe_fds, O_CLOEXEC) < 0)
-        goto err;
-
     /* Optional buffer sizing hints; kernel falls back to defaults if denied */
-    (void)fcntl(ctx->pipe_fds[1], F_SETPIPE_SZ, (int)AFALG_PIPE_SZ);
     (void)setsockopt(ctx->opfd, SOL_SOCKET, SO_SNDBUF, &sockbuf, sizeof(sockbuf));
     (void)setsockopt(ctx->opfd, SOL_SOCKET, SO_RCVBUF, &sockbuf, sizeof(sockbuf));
 
@@ -255,12 +241,12 @@ static int afalg_ensure_sw(AFALG_CTX *ctx)
 }
 
 /* -------------------------------------------------------------------------
- * Zero-copy vmsplice + splice pipeline
+ * Direct single-syscall sendmsg() + read() pipeline (no pipe/vmsplice/splice)
  * ------------------------------------------------------------------------- */
 
 /*
  * Processes `len` bytes (guaranteed to be a multiple of AES_BLOCK_SZ) through
- * AF_ALG using vmsplice -> splice -> read.
+ * AF_ALG using a single sendmsg() (msg_iov + msg_control) and read() per chunk.
  *
  * Contract:
  *   - `*done` always receives the exact number of bytes for which output has
@@ -269,14 +255,15 @@ static int afalg_ensure_sw(AFALG_CTX *ctx)
  *     when `in == out` before an error occurred, indicating that SW fallback
  *     must not re-process the overwritten buffer.
  */
-static int afalg_hw_zero_copy(AFALG_CTX *ctx,
-                              unsigned char *out,
-                              const unsigned char *in,
-                              size_t len,
-                              size_t *done,
-                              int *inplace_corrupted)
+static int afalg_hw_direct_sendmsg(AFALG_CTX *ctx,
+                                   unsigned char *out,
+                                   const unsigned char *in,
+                                   size_t len,
+                                   size_t *done,
+                                   int *inplace_corrupted)
 {
     struct msghdr msg;
+    struct iovec iov;
     struct cmsghdr *cmsg;
     struct af_alg_iv *alg_iv;
     size_t iv_len = ctx->info->iv_len;
@@ -295,6 +282,8 @@ static int afalg_hw_zero_copy(AFALG_CTX *ctx,
 
     memset(ctx->cbuf, 0, total_cmsg_len);
     memset(&msg, 0, sizeof(msg));
+    msg.msg_iov = &iov;
+    msg.msg_iovlen = 1;
     msg.msg_control = ctx->cbuf;
     msg.msg_controllen = total_cmsg_len;
 
@@ -314,30 +303,16 @@ static int afalg_hw_zero_copy(AFALG_CTX *ctx,
     cmsg->cmsg_len = iv_cmsg_len;
     alg_iv = (struct af_alg_iv *)CMSG_DATA(cmsg);
     alg_iv->ivlen = (uint32_t)iv_len;
-    memcpy(alg_iv->iv, ctx->iv, iv_len);
-
-    /* Send operation & IV control header for this hardware request */
-    for (;;) {
-        ssize_t ret = sendmsg(ctx->opfd, &msg, MSG_MORE);
-        if (ret >= 0)
-            break;
-        if (errno == EINTR)
-            continue;
-        return 0;
-    }
-    ctx->iv_dirty = 0;
 
     while (processed < len) {
         size_t chunk = len - processed;
-        int is_last_chunk;
         uint8_t saved_last_in[AES_BLOCK_SZ];
         const uint8_t *last_ct = NULL;
-        size_t fed = 0;
         size_t got = 0;
+        ssize_t sent;
 
-        if (chunk > AFALG_SPLICE_CHUNK)
-            chunk = AFALG_SPLICE_CHUNK;
-        is_last_chunk = (processed + chunk == len);
+        if (chunk > AFALG_SEND_CHUNK)
+            chunk = AFALG_SEND_CHUNK;
 
         /* For in-place CBC decryption, preserve last ciphertext block before overwrite */
         if (!ctx->info->is_ctr && !ctx->enc) {
@@ -345,41 +320,20 @@ static int afalg_hw_zero_copy(AFALG_CTX *ctx,
             last_ct = saved_last_in;
         }
 
-        while (fed < chunk) {
-            struct iovec iov = {
-                .iov_base = (void *)(in + processed + fed),
-                .iov_len = chunk - fed
-            };
-            ssize_t v = vmsplice(ctx->pipe_fds[1], &iov, 1, 0);
-            size_t to_splice;
-            size_t spliced = 0;
+        iov.iov_base = (void *)(in + processed);
+        iov.iov_len = chunk;
+        memcpy(alg_iv->iv, ctx->iv, iv_len);
 
-            if (v < 0) {
-                if (errno == EINTR)
-                    continue;
-                goto err;
-            }
-            if (v == 0)
-                goto err;
-
-            to_splice = (size_t)v;
-            while (spliced < to_splice) {
-                size_t rem_in_vec = to_splice - spliced;
-                unsigned int sflags = (!is_last_chunk || (fed + spliced + rem_in_vec < chunk))
-                                      ? SPLICE_F_MORE : 0;
-                ssize_t s = splice(ctx->pipe_fds[0], NULL, ctx->opfd, NULL,
-                                   rem_in_vec, sflags);
-                if (s < 0) {
-                    if (errno == EINTR)
-                        continue;
-                    goto err;
-                }
-                if (s == 0)
-                    goto err;
-                spliced += (size_t)s;
-            }
-            fed += to_splice;
+        for (;;) {
+            sent = sendmsg(ctx->opfd, &msg, 0);
+            if (sent >= 0)
+                break;
+            if (errno == EINTR)
+                continue;
+            goto err;
         }
+        if ((size_t)sent != chunk)
+            goto err;
 
         while (got < chunk) {
             ssize_t r = read(ctx->opfd, out + processed + got, chunk - got);
@@ -434,8 +388,6 @@ static AFALG_CTX *afalg_newctx_common(void *provctx, const AFALG_CIPHER_INFO *in
     ctx->hw_threshold = pctx->hw_threshold;
     ctx->tfmfd = -1;
     ctx->opfd = -1;
-    ctx->pipe_fds[0] = -1;
-    ctx->pipe_fds[1] = -1;
     ctx->padding = 1;
 
     ctx->cbuf_len = CMSG_SPACE(sizeof(uint32_t)) +
@@ -493,8 +445,6 @@ static void *afalg_dupctx(void *vctx)
     dst->hw_threshold = src->hw_threshold;
     dst->tfmfd = -1;
     dst->opfd = -1;
-    dst->pipe_fds[0] = -1;
-    dst->pipe_fds[1] = -1;
     dst->cbuf_len = src->cbuf_len;
 
     dst->enc = src->enc;
@@ -683,7 +633,7 @@ static int afalg_process_hw(AFALG_CTX *ctx,
     if (!afalg_ensure_hw(ctx))
         return afalg_process_sw(ctx, out, outl, outsize, in, len);
 
-    if (afalg_hw_zero_copy(ctx, out, in, len, &hw_done, &inplace_corrupted)) {
+    if (afalg_hw_direct_sendmsg(ctx, out, in, len, &hw_done, &inplace_corrupted)) {
         *outl = hw_done;
         return 1;
     }
@@ -1048,11 +998,11 @@ IMPLEMENT_AFALG_CIPHER(aes256ctr, 2)
 
 static const OSSL_ALGORITHM afalg_algorithms[] = {
     { "AES-128-CTR:id-aes128-CTR", "provider=afalgprov",
-      aes128ctr_functions, "LS1024A SPACC AES-128-CTR" },
+      aes128ctr_functions, "NXP LS1024A SPACC AES-128-CTR" },
     { "AES-192-CTR:id-aes192-CTR", "provider=afalgprov",
-      aes192ctr_functions, "LS1024A SPACC AES-192-CTR" },
+      aes192ctr_functions, "NXP LS1024A SPACC AES-192-CTR" },
     { "AES-256-CTR:id-aes256-CTR", "provider=afalgprov",
-      aes256ctr_functions, "LS1024A SPACC AES-256-CTR" },
+      aes256ctr_functions, "NXP LS1024A SPACC AES-256-CTR" },
     { NULL, NULL, NULL, NULL }
 };
 
@@ -1060,74 +1010,68 @@ static const OSSL_ALGORITHM afalg_algorithms[] = {
  * Provider entry points
  * ------------------------------------------------------------------------- */
 
-static const OSSL_PARAM afalg_prov_gettable_params_list[] = {
-    OSSL_PARAM_utf8_ptr(OSSL_PROV_PARAM_NAME, NULL, 0),
-    OSSL_PARAM_utf8_ptr(OSSL_PROV_PARAM_VERSION, NULL, 0),
-    OSSL_PARAM_utf8_ptr(OSSL_PROV_PARAM_BUILDINFO, NULL, 0),
-    OSSL_PARAM_int(OSSL_PROV_PARAM_STATUS, NULL),
-    OSSL_PARAM_size_t(AFALG_PROV_PARAM_HW_THRESHOLD, NULL),
-    OSSL_PARAM_END
-};
-
-static const OSSL_PARAM *afalg_prov_gettable_params(void *provctx)
-{
-    (void)provctx;
-    return afalg_prov_gettable_params_list;
-}
-
-static int afalg_prov_get_params(void *provctx, OSSL_PARAM params[])
-{
-    AFALG_PROV_CTX *pctx = (AFALG_PROV_CTX *)provctx;
-    OSSL_PARAM *p;
-
-    if (pctx == NULL)
-        return 0;
-
-    p = OSSL_PARAM_locate(params, OSSL_PROV_PARAM_NAME);
-    if (p != NULL && !OSSL_PARAM_set_utf8_ptr(p, "LS1024A SPACC AF_ALG Provider"))
-        return 0;
-
-    p = OSSL_PARAM_locate(params, OSSL_PROV_PARAM_VERSION);
-    if (p != NULL && !OSSL_PARAM_set_utf8_ptr(p, "1.1.0"))
-        return 0;
-
-    p = OSSL_PARAM_locate(params, OSSL_PROV_PARAM_BUILDINFO);
-    if (p != NULL && !OSSL_PARAM_set_utf8_ptr(p, OPENSSL_FULL_VERSION_STR))
-        return 0;
-
-    p = OSSL_PARAM_locate(params, OSSL_PROV_PARAM_STATUS);
-    if (p != NULL && !OSSL_PARAM_set_int(p, 1))
-        return 0;
-
-    p = OSSL_PARAM_locate(params, AFALG_PROV_PARAM_HW_THRESHOLD);
-    if (p != NULL && !OSSL_PARAM_set_size_t(p, pctx->hw_threshold))
-        return 0;
-
-    return 1;
-}
-
 static const OSSL_ALGORITHM *afalg_query(void *provctx,
                                          int operation_id,
                                          int *no_cache)
 {
     (void)provctx;
     *no_cache = 0;
-
     if (operation_id == OSSL_OP_CIPHER)
         return afalg_algorithms;
-
     return NULL;
+}
+
+static const OSSL_PARAM afalg_prov_known_gettable_params[] = {
+    OSSL_PARAM_utf8_ptr(OSSL_PROV_PARAM_NAME, NULL, 0),
+    OSSL_PARAM_utf8_ptr(OSSL_PROV_PARAM_VERSION, NULL, 0),
+    OSSL_PARAM_utf8_ptr(OSSL_PROV_PARAM_BUILDINFO, NULL, 0),
+    OSSL_PARAM_int(OSSL_PROV_PARAM_STATUS, NULL),
+    OSSL_PARAM_END
+};
+
+static const OSSL_PARAM *afalg_prov_gettable_params(void *provctx)
+{
+    (void)provctx;
+    return afalg_prov_known_gettable_params;
+}
+
+static int afalg_prov_get_params(void *provctx, OSSL_PARAM params[])
+{
+    OSSL_PARAM *p;
+    (void)provctx;
+
+    p = OSSL_PARAM_locate(params, OSSL_PROV_PARAM_NAME);
+    if (p != NULL && !OSSL_PARAM_set_utf8_ptr(p, "NXP LS1024A SPACC AF_ALG Provider"))
+        return 0;
+
+    p = OSSL_PARAM_locate(params, OSSL_PROV_PARAM_VERSION);
+    if (p != NULL && !OSSL_PARAM_set_utf8_ptr(p, "3.4"))
+        return 0;
+
+    p = OSSL_PARAM_locate(params, OSSL_PROV_PARAM_BUILDINFO);
+    if (p != NULL && !OSSL_PARAM_set_utf8_ptr(p, "OpenSSL 3.5 AF_ALG Direct sendmsg (SPACC DMA)"))
+        return 0;
+
+    p = OSSL_PARAM_locate(params, OSSL_PROV_PARAM_STATUS);
+    if (p != NULL && !OSSL_PARAM_set_int(p, 1))
+        return 0;
+
+    return 1;
 }
 
 static void afalg_teardown(void *provctx)
 {
-    OPENSSL_free(provctx);
+    AFALG_PROV_CTX *pctx = (AFALG_PROV_CTX *)provctx;
+    if (pctx != NULL) {
+        if (pctx->libctx != NULL)
+            OSSL_LIB_CTX_free(pctx->libctx);
+        OPENSSL_free(pctx);
+    }
 }
 
-static const OSSL_DISPATCH afalg_prov_functions[] = {
+static const OSSL_DISPATCH afalg_dispatch_table[] = {
     { OSSL_FUNC_PROVIDER_TEARDOWN, (void (*)(void))afalg_teardown },
-    { OSSL_FUNC_PROVIDER_GETTABLE_PARAMS,
-      (void (*)(void))afalg_prov_gettable_params },
+    { OSSL_FUNC_PROVIDER_GETTABLE_PARAMS, (void (*)(void))afalg_prov_gettable_params },
     { OSSL_FUNC_PROVIDER_GET_PARAMS, (void (*)(void))afalg_prov_get_params },
     { OSSL_FUNC_PROVIDER_QUERY_OPERATION, (void (*)(void))afalg_query },
     { 0, NULL }
@@ -1138,31 +1082,24 @@ int OSSL_provider_init(const OSSL_CORE_HANDLE *handle,
                        const OSSL_DISPATCH **out,
                        void **provctx)
 {
-    AFALG_PROV_CTX *pctx;
-    OSSL_FUNC_core_get_libctx_fn *c_get_libctx = NULL;
     OSSL_FUNC_core_get_params_fn *c_get_params = NULL;
+    AFALG_PROV_CTX *pctx;
 
     for (; in->function_id != 0; in++) {
-        switch (in->function_id) {
-        case OSSL_FUNC_CORE_GET_LIBCTX:
-            c_get_libctx = OSSL_FUNC_core_get_libctx(in);
-            break;
-        case OSSL_FUNC_CORE_GET_PARAMS:
+        if (in->function_id == OSSL_FUNC_CORE_GET_PARAMS)
             c_get_params = OSSL_FUNC_core_get_params(in);
-            break;
-        default:
-            break;
-        }
     }
-
-    if (c_get_libctx == NULL)
-        return 0;
 
     pctx = OPENSSL_zalloc(sizeof(*pctx));
     if (pctx == NULL)
         return 0;
 
-    pctx->libctx = (OSSL_LIB_CTX *)c_get_libctx(handle);
+    pctx->libctx = OSSL_LIB_CTX_new_from_dispatch(handle, in);
+    if (pctx->libctx == NULL) {
+        OPENSSL_free(pctx);
+        return 0;
+    }
+
     pctx->hw_threshold = SPACC_HW_THRESHOLD;
 
     if (c_get_params != NULL) {
@@ -1171,19 +1108,14 @@ int OSSL_provider_init(const OSSL_CORE_HANDLE *handle,
             OSSL_PARAM_utf8_ptr(AFALG_PROV_PARAM_HW_THRESHOLD, &thresh_str, 0),
             OSSL_PARAM_END
         };
-
         if (c_get_params(handle, core_params) && thresh_str != NULL) {
-            char *endp = NULL;
-            unsigned long long val = strtoull(thresh_str, &endp, 0);
-
-            if (endp != thresh_str && *endp == '\0' &&
-                val >= SPACC_HW_THRESHOLD && val <= SIZE_MAX) {
+            unsigned long val = strtoul(thresh_str, NULL, 10);
+            if (val >= SPACC_HW_THRESHOLD)
                 pctx->hw_threshold = (size_t)val;
-            }
         }
     }
 
-    *out = afalg_prov_functions;
     *provctx = pctx;
+    *out = afalg_dispatch_table;
     return 1;
 }
