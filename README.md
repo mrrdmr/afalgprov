@@ -33,13 +33,6 @@ High-throughput OpenSSL 3.5+ `EVP_CIPHER` provider for the **NXP LS1024A** (Dual
 
 ---
 
-## Project Layout
-
-* `afalgprov.c` — Provider entry point (`OSSL_provider_init`), `AES-128/192/256-CTR` `skcipher` implementation, and algorithm dispatch registry.
-* `afalg_gcm.h` / `afalg_gcm.c` — `AES-128/192/256-GCM` `aead` module (`AF_ALG` `aead` `gcm(aes)`).
-* `Makefile` — Builds `afalgprov.so` from `afalgprov.c` + `afalg_gcm.c` and installs it to `$(openssl version -m)`.
-
----
 
 ## Build & Install
 
