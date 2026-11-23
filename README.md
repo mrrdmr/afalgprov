@@ -11,7 +11,6 @@ Hardware-accelerated **OpenSSL 3.5+** provider built on the Linux `AF_ALG` socke
 
 ### Prerequisites
 
-* Linux kernel with `CONFIG_CRYPTO_USER_API_SKCIPHER`, `CONFIG_CRYPTO_USER_API_AEAD`, and the `elp_spacc` driver (`ctr-aes-ls1024a-spacc`, `ghash-ce`) enabled.
 * `gcc` and OpenSSL 3.x development headers (`libssl-dev`).
 
 ### Compile and Install
