@@ -8,7 +8,7 @@ A dynamic cryptographic provider for **OpenSSL 3.5** on the **NXP LS1024A** plat
 
 ## 1. Purpose and Architecture
 
-ARM Cortex-A9 processors lack hardware AES cryptographic instructions (ARMv8 Crypto Extensions), causing software encryption in user space to fully saturate a single CPU core. The **`afalgprov` (v3.3)** module integrates globally into OpenSSL 3.5 with a soft system-wide preference (`?provider=afalgprov`) and implements a hybrid execution model: large streaming `AES-CTR` buffers (`≥ 8192` bytes) are offloaded to the hardware DMA accelerator via a `vmsplice` + `splice` pipeline, while small packets, unaligned tails, `AES-CBC`, and AEAD modes are handled by the optimized user-space `default` provider (with **Kernel TLS (`kTLS`)** offloading for `AES-GCM`, which uses `ctr(aes)` under the hood).
+ARM Cortex-A9 processors lack hardware AES cryptographic instructions (ARMv8 Crypto Extensions), causing software encryption in user space to fully saturate a single CPU core (or both cores under concurrent load). The **`afalgprov` (v3.3)** module integrates globally into OpenSSL 3.5 with a soft system-wide preference (`?provider=afalgprov`) and implements a hybrid execution model: large streaming `AES-CTR` buffers (`≥ 8192` bytes) are offloaded to the hardware DMA accelerator via a `vmsplice` + `splice` pipeline, while small packets, unaligned tails, `AES-CBC`, and AEAD modes are handled by the optimized user-space `default` provider (with **Kernel TLS (`kTLS`)** offloading for `AES-GCM`, which uses `ctr(aes)` under the hood).
 
 ### Registered Algorithms and Buffer Routing
 
@@ -45,7 +45,9 @@ ARM Cortex-A9 processors lack hardware AES cryptographic instructions (ARMv8 Cry
 
 ### Performance Benchmarks on NXP LS1024A
 
-Measured throughput and CPU utilization on the **NXP LS1024A** board (OpenSSL 3.5.7, ARM Cortex-A9, `OPENSSL_armcap=0x1`) using `65,536`-byte (64 KiB) blocks with `-elapsed` (wall-clock time) and `/usr/bin/time -p` (`10,980` SPACC DMA interrupts recorded across all 3 hardware runs: `135,893 → 146,873`, matching `5,490` 64 KiB blocks split into `57,344 + 8,192`-byte chunks = 2 hardware commands per block):
+#### Single-Thread Throughput & CPU Utilization (`-multi 1`, 64 KiB Blocks)
+
+Measured throughput and CPU utilization on the **NXP LS1024A** board (OpenSSL 3.5.7, dual-core ARM Cortex-A9, `OPENSSL_armcap=0x1`) using `65,536`-byte (64 KiB) blocks with `-elapsed` (wall-clock time) and `/usr/bin/time -p` (`10,980` SPACC DMA interrupts recorded across all 3 hardware runs: `135,893 → 146,873`, matching `5,490` 64 KiB blocks split into `57,344 + 8,192`-byte chunks = 2 hardware commands per block):
 
 | Algorithm and Mode | Pure CPU (`OPENSSL_CONF=/dev/null`, `default` only) | Hardware SPACC (`afalgprov`, DMA IRQ 45) | Throughput Gain | CPU Time (`user + sys` over ~3.06–3.07s run) | Role in System |
 | :--- | :--- | :--- | :--- | :--- | :--- |
@@ -54,6 +56,19 @@ Measured throughput and CPU utilization on the **NXP LS1024A** board (OpenSSL 3.
 | **`AES-256-CTR`** | **21.2 MB/s** (`21,207 k`) | **40.1 MB/s** (`40,064 k`) | **+88.9% (1.89x)** | Reduced from **100%** (`3.04s + 0.02s`) to **26.1%** (`0.07s + 0.73s`) — **3.8x less CPU** | `OpenSSH` (`aes256-ctr`), `openssl enc` |
 | **`ChaCha20-Poly1305`** | **60.9 MB/s** (`60,883 k`) | *Not supported by SPACC* | Fastest AEAD on CPU | ~100% of 1 CPU core (ARMv7 NEON) | Primary cipher for TLS 1.3 / HTTPS |
 | **`AES-128-GCM`** | **12.9 MB/s** (`12,867 k`) | *Offloaded to Kernel via `kTLS` (`ctr(aes)`)* | **-61.0% CPU** via kTLS | Total process CPU cut from `25.82s` to `10.08s` (128 MiB TLS 1.3 transfer) | TLS 1.3 compatibility (`Options = KTLS`) |
+
+#### Multi-Threaded Scaling (`-multi 2` and `-multi 4`, 64 KiB Blocks, Dual-Core Cortex-A9)
+
+Measured under concurrent multi-process workloads (`openssl speed -multi 2` and `-multi 4`) across both ARM Cortex-A9 cores (`~6.16–6.22s` maximum combined dual-core CPU budget per `~3.08–3.11s` wall-clock run; `+15,126` SPACC IRQs across `-multi 2` and `+16,553` SPACC IRQs across `-multi 4`):
+
+| Concurrency (`-multi`) | Algorithm | Pure CPU (`default` — 2 Cortex-A9 Cores) | Hardware SPACC DMA (`afalgprov`) | Throughput Gain | Dual-Core CPU Utilization (`user + sys` vs. ~6.2s budget) |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **`-multi 2`** *(2 workers)* | **`AES-128-CTR`** | 54.7 MB/s (`54,706 k`) | **55.3 MB/s** (`55,339 k`) | **+1.2%** | `1.81s` (**29%**) vs. `5.97s` (**97%**) — **3.3x less CPU** |
+| **`-multi 2`** *(2 workers)* | **`AES-192-CTR`** | 48.0 MB/s (`48,016 k`) | **55.7 MB/s** (`55,706 k`) | **+16.0%** | `1.85s` (**30%**) vs. `5.96s` (**97%**) — **3.2x less CPU** |
+| **`-multi 2`** *(2 workers)* | **`AES-256-CTR`** | 41.2 MB/s (`41,204 k`) | **54.6 MB/s** (`54,552 k`) | **+32.4%** | `1.73s` (**28%**) vs. `5.93s` (**96%**) — **3.4x less CPU** |
+| **`-multi 4`** *(4 workers)* | **`AES-128-CTR`** | 54.2 MB/s (`54,160 k`) | **60.4 MB/s** (`60,409 k`) | **+11.5%** | `2.33s` (**38%**) vs. `5.99s` (**97%**) — **2.6x less CPU** |
+| **`-multi 4`** *(4 workers)* | **`AES-192-CTR`** | 46.7 MB/s (`46,722 k`) | **59.7 MB/s** (`59,738 k`) | **+27.9%** | `2.29s` (**37%**) vs. `6.10s` (**98%**) — **2.7x less CPU** |
+| **`-multi 4`** *(4 workers)* | **`AES-256-CTR`** | 40.2 MB/s (`40,164 k`) | **59.3 MB/s** (`59,329 k`) | **+47.7%** | `2.45s` (**39%**) vs. `6.07s` (**98%**) — **2.5x less CPU** |
 
 #### TLS 1.3 `AES-GCM` Loopback Benchmark (128 MiB Transfer, 64 KiB Chunks, Client + Server)
 
@@ -65,31 +80,43 @@ Measured throughput and CPU utilization on the **NXP LS1024A** board (OpenSSL 3.
 | **`TLS_AES_256_GCM_SHA384` (`Options = KTLS`)** | `2 / 2` (`TlsTxSw`/`TlsRxSw` → `ctr(aes)`, `+16,306` SPACC IRQs) | **10.07 MB/s** (+21.2%) | **12.72 s** | **9.98 s** (**-65.9% CPU** — **2.93x less CPU**) |
 
 ### Key Takeaways from Benchmarks
-1. **Constant ~39.8–40.1 MB/s Hardware Ceiling Across All Key Lengths (128/192/256-bit):**
-   While software `AES-CTR` slows down significantly as key length increases from 128 to 256 bits (`28.9 → 21.2 MB/s`), SPACC DMA maintains a flat **~40 MB/s** across all key sizes—delivering **1.89x throughput** on `AES-256-CTR` while cutting user-space CPU time from **3.04s down to 0.07–0.08s** (~70–74% total CPU offload).
-2. **Verified 1:1 Hardware Offload Ratio:**
-   Across the 3 `AES-CTR` benchmark runs (`1,820 + 1,836 + 1,834 = 5,490` 64 KiB ops, each split into `57,344 + 8,192` bytes = `10,980` hardware chunks), the `9b000000.crypto` interrupt counter (IRQ 45) incremented by **`+10,980`** (`135,893 → 146,873`), confirming zero software fallback on large aligned buffers.
-3. **Uniform ~10.1–10.2 MB/s kTLS Ceiling for Both 128-bit and 256-bit `AES-GCM`:**
-   With `Options = KTLS` enabled, the Linux kernel delegates the `CTR` stage of `AES-GCM` to `ctr-aes-ls1024a-spacc` (`+16,278` SPACC IRQs for `TLS_AES_128_GCM_SHA256`; `+16,306` for `TLS_AES_256_GCM_SHA384`), eliminating key-size penalties (`10.24 MB/s` vs. `10.07 MB/s`) and reducing combined client+server CPU usage by **61–66%**.
-4. **Optimal System-Wide Split (`afalgprov` + `kTLS` + `ChaCha20-Poly1305`):**
-   Combining `afalgprov` for streaming `AES-CTR` with **`Options = KTLS`** for `AES-GCM` and `ChaCha20-Poly1305` priority for TLS 1.3 (**60.9 MB/s** vs. **12.9 MB/s** for software `AES-128-GCM`) maximizes efficiency across all workloads on NXP LS1024A.
+1. **Constant ~39.8–40.1 MB/s Single-Stream Ceiling & ~60.4 MB/s Multi-Stream DMA Saturation:**
+   In single-threaded mode (`-multi 1`), synchronous `sendmsg → splice → read` round-trips cap throughput at **~40.1 MB/s** across all key lengths (`1.89x` faster than software `AES-256-CTR`). Under concurrent load (`-multi 2` and `-multi 4`), queued descriptors keep the SPACC DMA pipeline continuously busy between interrupts, scaling aggregate hardware throughput up to **55.7 MB/s** (2 workers) and **60.4 MB/s** (4 workers)—surpassing both Cortex-A9 cores running at 100% saturation (`54.2 MB/s` for 128-bit and `40.2 MB/s` for 256-bit).
+2. **Zero Key-Length Penalty Under Concurrent Load (128 / 192 / 256-bit):**
+   With 4 workers on pure CPU, increasing key length from 128 to 256 bits drops total throughput by 25.8% (`54.2 → 40.2 MB/s`). SPACC DMA sustains a flat **59.3–60.4 MB/s** regardless of key size (**+47.7%** faster than dual-core CPU on `AES-256-CTR`).
+3. **60–72% Dual-Core CPU Headroom Preserved Under Heavy Encryption:**
+   Pure software encryption saturates **96–98%** of total dual-core CPU capacity (`~5.93–6.10s` out of `~6.2s`). `afalgprov` reduces combined dual-core CPU utilization to **28–39%**, leaving **1.2–1.4+ CPU cores free** for network packet processing, storage I/O, and application logic.
+4. **Verified 1:1 Hardware Offload Ratio & kTLS `AES-GCM` Acceleration:**
+   Across the single-thread `AES-CTR` runs (`1,820 + 1,836 + 1,834 = 5,490` 64 KiB ops = `10,980` hardware chunks), IRQ 45 incremented by exact **`+10,980`** (`135,893 → 146,873`). Similarly, `Options = KTLS` offloads `AES-GCM`'s `CTR` stage to `ctr-aes-ls1024a-spacc` (`+16,278` to `+16,306` SPACC IRQs), eliminating key-size penalties (`10.24 MB/s` vs. `10.07 MB/s`) and cutting combined client+server CPU usage by **61–66%**.
 
 ### Reproducing Benchmarks (`OPENSSL_CONF=/dev/null` vs. `afalgprov`)
 
 ~~~bash
 echo "=== 0. IRQ BASELINE ===" && \
 grep crypto /proc/interrupts && \
-echo "=== 1. PURE CPU (OPENSSL_CONF=/dev/null, default only) ===" && \
+echo "=== 1. PURE CPU (-multi 1, OPENSSL_CONF=/dev/null, default only) ===" && \
 for alg in aes-128-ctr aes-192-ctr aes-256-ctr; do
-  OPENSSL_CONF=/dev/null /usr/bin/time -p openssl speed -elapsed -provider default -evp "$alg" -bytes 65536 2>&1 | grep -E "Doing|AES-|real|user|sys"
+  OPENSSL_CONF=/dev/null /usr/bin/time -p openssl speed -elapsed -provider default -evp "$alg" -bytes 65536 2>&1 | grep -iE "Doing|^AES-|real|user|sys"
 done && \
 grep crypto /proc/interrupts && \
-echo "=== 2. HARDWARE SPACC DMA (afalgprov) ===" && \
+echo "=== 2. HARDWARE SPACC DMA (-multi 1, afalgprov) ===" && \
 for alg in aes-128-ctr aes-192-ctr aes-256-ctr; do
-  /usr/bin/time -p openssl speed -elapsed -provider afalgprov -provider default -evp "$alg" -bytes 65536 2>&1 | grep -E "Doing|AES-|real|user|sys"
+  /usr/bin/time -p openssl speed -elapsed -provider afalgprov -provider default -evp "$alg" -bytes 65536 2>&1 | grep -iE "Doing|^AES-|real|user|sys"
 done && \
 grep crypto /proc/interrupts && \
-echo "=== 3. CPU AEAD: ChaCha20-Poly1305 vs AES-128-GCM ===" && \
+echo "=== 3. MULTI-THREADED SCALING (-multi 2 & -multi 4) ===" && \
+for threads in 2 4; do
+  echo "--- PURE CPU (-multi $threads) ---"
+  for alg in aes-128-ctr aes-192-ctr aes-256-ctr; do
+    OPENSSL_CONF=/dev/null /usr/bin/time -p openssl speed -elapsed -multi "$threads" -provider default -evp "$alg" -bytes 65536 2>&1 | grep -iE "^AES-|real|user|sys"
+  done
+  echo "--- HARDWARE SPACC DMA (-multi $threads) ---"
+  for alg in aes-128-ctr aes-192-ctr aes-256-ctr; do
+    /usr/bin/time -p openssl speed -elapsed -multi "$threads" -provider afalgprov -provider default -evp "$alg" -bytes 65536 2>&1 | grep -iE "^AES-|real|user|sys"
+  done
+  grep crypto /proc/interrupts
+done && \
+echo "=== 4. CPU AEAD: ChaCha20-Poly1305 vs AES-128-GCM ===" && \
 OPENSSL_CONF=/dev/null openssl speed -elapsed -provider default -evp chacha20-poly1305 -bytes 65536 2>&1 | grep -E "Doing|ChaCha20" && \
 OPENSSL_CONF=/dev/null openssl speed -elapsed -provider default -evp aes-128-gcm -bytes 65536 2>&1 | grep -E "Doing|AES-"
 ~~~
