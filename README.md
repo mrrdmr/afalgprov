@@ -9,7 +9,7 @@ High-throughput OpenSSL 3.5+ `EVP_CIPHER` provider for the **NXP LS1024A** (Dual
 
 ---
 
-## Core Benchmarks (NXP LS1024A, Linux 6.18, OpenSSL 3.5)
+## Core Benchmarks (NXP LS1024A, Linux 6.18, OpenSSL 3.5.9)
 
 *CPU Load is normalized to **1 Cortex-A9 Core (`100%` = 1 full core; `200%` = both cores fully saturated)**.*
 
@@ -18,7 +18,7 @@ High-throughput OpenSSL 3.5+ `EVP_CIPHER` provider for the **NXP LS1024A** (Dual
 | **`AES-128/256-CTR`** *(Pure CPU)* | `64 KiB` | 1 | `29.40 MB/s` | `100.0%` | Baseline software AES (saturates 1 core). |
 | **`AES-128/256-CTR`** *(`afalgprov` v3.4)* | `64 KiB` | 1 | **`42.20 MB/s`** | **`29.3%`** | **-71% CPU** vs software AES (`+43.5%` speed). |
 | **`AES-128/256-CTR`** *(`afalgprov` v3.4)* | `64 KiB` | 2 (`-multi 2`) | **`57.65 MB/s`** | **`54.2%`** | Multi-stream SSH/SFTP/bulk transfer. |
-| **`AES-128/256-CTR`** *(`afalgprov` v3.4)* | `64 KiB` | 4 (`-multi 4`) | **`64.30 MB/s`** | **`74.8%`** | Peak hardware SPACC throughput (`>1.25` cores free). |
+| **`AES-128/256-CTR`** *(`afalgprov` v3.4)* | `64 KiB` | 4 (`-multi 4`) | **`65.82 MB/s`** | **`63.3%`** | Peak hardware SPACC throughput (`>1.36` cores free). |
 | **`ChaCha20-Poly1305`** *(NEON `default`)* | `16 KiB` | 2 (`-multi 2`) | **`141.36 MB/s`** | **`197.4%` (both cores)** | Optimal TLS 1.3 / HTTPS AEAD cipher (~98.7% per core across 2 cores). |
 | **`AES-128-GCM`** *(Unidirectional `kTLS TX`)* | `16 KiB` | 1 | **`11.90 MB/s`** | **`38.3%`** | `CTR` offloaded to SPACC; `GHASH` on CPU. |
 
@@ -27,12 +27,14 @@ High-throughput OpenSSL 3.5+ `EVP_CIPHER` provider for the **NXP LS1024A** (Dual
 ## Build & Install
 
 ```bash
-gcc -O3 -march=armv7-a -mfpu=neon -mfloat-abi=hard -fPIC -shared \
-    afalgprov.c -o afalgprov.so -lcrypto
+# 1. Install build dependencies (OpenSSL headers and compiler)
+apt-get update && apt-get install -y build-essential libssl-dev
 
-MODULES_DIR=$(openssl version -m | awk -F'"' '{print $2}')
-install -m 0755 afalgprov.so "$MODULES_DIR/afalgprov.so"
+# 2. Build and install afalgprov.so
+make
+make install
 
+# 3. Enable kernel TLS module
 modprobe tls
 echo "tls" > /etc/modules-load.d/tls.conf
 ```
