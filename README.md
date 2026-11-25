@@ -116,5 +116,4 @@ Measured on **NXP LS1024A (Dual ARMv7 Cortex-A9)** under default kernel buffer l
 
 * **Single-thread `AES-128/192/256-GCM`:** **2.07x–2.39x** faster than pure CPU (`26.43–26.63 MB/s` vs `11.08–12.87 MB/s`) while cutting total CPU load from **~49.8–49.9%** down to **~7.3–8.0%** (`-84.0%` to `-85.3%`).
 * **Multi-thread `AES-128/192/256-GCM`:** Reaches **~31.9–32.0 MB/s** (`2T`) and plateaus at **~32.4–32.5 MB/s** (`4T`), reducing total 2-core CPU load from **~98.2–98.7%** to **~12.5–13.4%** (`2T`, `-86.3%` to `-87.4%`) and **~14.3–15.3%** (`4T`, `-84.5%` to `-85.4%`).
-* **Deferred GCM Decrypt (`deferred=1`, 64 KiB):** Reaches **18.68 MB/s** (`+11.1%` over the `16.82 MB/s` unoptimized baseline) while keeping caller `out` untouched on tag failure (`outl=0`, `rc_final=0`, `out_untouched=1`).
 * **Multi-thread `AES-CTR` Scaling:** Scales from **~41.6–41.9 MB/s** (`1T`) to **~58.4–58.8 MB/s** (`2T`) and **~64.3–64.5 MB/s** (`4T`), cutting 2-core CPU load to **~13.0–13.5%** (`1T`, `-72.9%` to `-73.9%`), **~27.5–28.5%** (`2T`, `-71.2%` to `-72.2%`), and **~41.7–42.5%** (`4T`, `-57.2%` to `-58.0%`) with matching IRQ 45 (`9b000000.crypto`) activity on SPACC.
