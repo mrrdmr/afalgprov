@@ -38,10 +38,13 @@
 #endif
 
 #define SPACC_HW_THRESHOLD          8192U
-#define AFALG_SEND_CHUNK            57344U
+#define SPACC_MAX_CHUNK_BYTES       65520U
+#define SPACC_MAX_SGL_CHUNK_BYTES   (15U * 4096U)
+#define SPACC_MIN_TAIL_HW_BYTES     2048U
+#define AFALG_SEND_CHUNK            SPACC_MAX_SGL_CHUNK_BYTES
 
-#define AFALG_GCM_MIN_HW_BYTES      4096U
-#define AFALG_GCM_L2_OPTIMAL_MAX    (1024U * 1024U)
+#define AFALG_GCM_MIN_HW_BYTES      8192U
+#define AFALG_GCM_L2_OPTIMAL_MAX    (256U * 1024U)
 #define AFALG_GCM_SKB_OVERHEAD      (24U * 1024U)
 #define AFALG_GCM_FALLBACK_WMEM     212992U
 
@@ -90,12 +93,12 @@ static void afalg_detect_kernel_limits(size_t *ctr_send_chunk,
 
     *sock_buf_req = (limit > (size_t)INT_MAX) ? INT_MAX : (int)limit;
 
-    /* Keep CTR chunk <= limit / 2 (aligned to AES block) to avoid socket deadlock */
+    /* Keep CTR chunk <= limit / 2 (aligned to AES block) and within SGL chunk limit */
     safe_ctr_chunk = ((limit / 2U) / AES_BLOCK_SZ) * AES_BLOCK_SZ;
     if (safe_ctr_chunk < AES_BLOCK_SZ)
         safe_ctr_chunk = AES_BLOCK_SZ;
-    if (safe_ctr_chunk > AFALG_SEND_CHUNK)
-        safe_ctr_chunk = AFALG_SEND_CHUNK;
+    if (safe_ctr_chunk > SPACC_MAX_SGL_CHUNK_BYTES)
+        safe_ctr_chunk = SPACC_MAX_SGL_CHUNK_BYTES;
     *ctr_send_chunk = safe_ctr_chunk;
 
     if (limit <= AFALG_GCM_SKB_OVERHEAD) {
@@ -769,6 +772,16 @@ static int afalg_update(void *vctx,
     hw_len = (rem_after_prefix / AES_BLOCK_SZ) * AES_BLOCK_SZ;
     tail_len = rem_after_prefix - hw_len;
 
+    if (tail_len == 0 && hw_len > SPACC_MAX_SGL_CHUNK_BYTES) {
+        size_t full_chunks = hw_len / SPACC_MAX_SGL_CHUNK_BYTES;
+        size_t chunk_rem = hw_len % SPACC_MAX_SGL_CHUNK_BYTES;
+
+        if (chunk_rem > 0 && chunk_rem < SPACC_MIN_TAIL_HW_BYTES) {
+            hw_len = full_chunks * SPACC_MAX_SGL_CHUNK_BYTES;
+            tail_len = chunk_rem;
+        }
+    }
+
     if (hw_len < ctx->hw_threshold)
         return afalg_process_sw(ctx, out, outl, outsize, in, inl);
 
@@ -1016,6 +1029,9 @@ typedef struct {
     uint8_t *cbuf;
     size_t cbuf_len;
 
+    uint8_t *scratch;
+    size_t scratch_cap;
+
     uint8_t *saved_ct;
     size_t saved_ct_len;
     size_t saved_ct_cap;
@@ -1028,6 +1044,7 @@ typedef struct {
 
     EVP_CIPHER *sw_cipher;
     EVP_CIPHER_CTX *sw_ctx;
+    int sw_inited;
     int force_sw;
     int used_hw_stream;
 
@@ -1050,6 +1067,32 @@ static const AFALG_GCM_INFO gcm_table[] = {
     { "AES-192-GCM", 24 },
     { "AES-256-GCM", 32 },
 };
+
+static uint8_t *afalg_gcm_get_scratch(AFALG_GCM_CTX *ctx, size_t len)
+{
+    size_t new_cap;
+    uint8_t *nb;
+
+    if (len <= ctx->scratch_cap)
+        return ctx->scratch;
+
+    new_cap = ctx->scratch_cap ? ctx->scratch_cap : len;
+    while (new_cap < len) {
+        if (new_cap > SIZE_MAX / 2U) {
+            new_cap = len;
+            break;
+        }
+        new_cap *= 2U;
+    }
+
+    nb = OPENSSL_realloc(ctx->scratch, new_cap);
+    if (nb == NULL)
+        return NULL;
+
+    ctx->scratch = nb;
+    ctx->scratch_cap = new_cap;
+    return ctx->scratch;
+}
 
 static int afalg_gcm_fits_hw_payload(const AFALG_GCM_CTX *ctx, size_t payload_len)
 {
@@ -1155,6 +1198,10 @@ static int afalg_gcm_ensure_sw(AFALG_GCM_CTX *ctx)
         ctx->sw_ctx = EVP_CIPHER_CTX_new();
         if (ctx->sw_ctx == NULL)
             return 0;
+        ctx->sw_inited = 0;
+    }
+
+    if (!ctx->sw_inited) {
         if (!EVP_CipherInit_ex(ctx->sw_ctx, ctx->sw_cipher, NULL, NULL, NULL, ctx->enc))
             goto err;
         if (!EVP_CIPHER_CTX_ctrl(ctx->sw_ctx, EVP_CTRL_AEAD_SET_IVLEN,
@@ -1168,6 +1215,7 @@ static int afalg_gcm_ensure_sw(AFALG_GCM_CTX *ctx)
                                    ctx->aad_buf, ctx->aad_len))
                 goto err;
         }
+        ctx->sw_inited = 1;
     }
 
     return 1;
@@ -1175,13 +1223,10 @@ static int afalg_gcm_ensure_sw(AFALG_GCM_CTX *ctx)
 err:
     EVP_CIPHER_CTX_free(ctx->sw_ctx);
     ctx->sw_ctx = NULL;
+    ctx->sw_inited = 0;
     return 0;
 }
 
-/*
- * OpenSSL 3.x default GCM final requires a non-NULL output pointer even when
- * remaining output capacity is 0 (GCM writes 0 bytes on Final).
- */
 static int afalg_gcm_sw_final_call(EVP_CIPHER_CTX *sw_ctx,
                                    unsigned char *out,
                                    size_t outsize,
@@ -1243,12 +1288,6 @@ static int afalg_gcm_sw_update(AFALG_GCM_CTX *ctx,
     return 1;
 }
 
-/*
- * Return codes:
- *  1 = success
- * -1 = authentication failure (EBADMSG) on decrypt -> do NOT retry in SW
- *  0 = transport / hardware error -> caller may fallback if safe
- */
 static int afalg_gcm_hw_oneshot(AFALG_GCM_CTX *ctx,
                                 unsigned char *out,
                                 const unsigned char *in,
@@ -1271,7 +1310,6 @@ static int afalg_gcm_hw_oneshot(AFALG_GCM_CTX *ctx,
     uint32_t assoclen;
     ssize_t sent, recvd;
 
-    /* Never invoke HW oneshot on empty payload (avoids 0-iovec readv auth bypass) */
     if (len == 0 || in == NULL || out == NULL)
         return 0;
 
@@ -1444,6 +1482,8 @@ static void afalg_gcm_freectx(void *vctx)
         EVP_CIPHER_free(ctx->sw_cipher);
     if (ctx->cbuf != NULL)
         OPENSSL_clear_free(ctx->cbuf, ctx->cbuf_len);
+    if (ctx->scratch != NULL)
+        OPENSSL_clear_free(ctx->scratch, ctx->scratch_cap);
     if (ctx->saved_ct != NULL)
         OPENSSL_clear_free(ctx->saved_ct, ctx->saved_ct_cap);
     if (ctx->aad_buf != NULL)
@@ -1476,6 +1516,7 @@ static void *afalg_gcm_dupctx(void *vctx)
     dst->max_hw_payload = src->max_hw_payload;
     dst->sock_buf_req = src->sock_buf_req;
     dst->cbuf_len = src->cbuf_len;
+    dst->sw_inited = src->sw_inited;
     dst->force_sw = src->force_sw;
     dst->used_hw_stream = src->used_hw_stream;
     dst->enc = src->enc;
@@ -1557,15 +1598,11 @@ static int afalg_gcm_init_common(void *vctx,
     ctx->tag_len = GCM_TAG_SZ;
     ctx->aad_len = 0;
     ctx->saved_ct_len = 0;
+    ctx->sw_inited = 0;
     ctx->force_sw = 0;
     ctx->used_hw_stream = 0;
     ctx->tls_aad_len = (size_t)-1;
     ctx->tls_aad_pad = 0;
-
-    if (ctx->sw_ctx != NULL) {
-        EVP_CIPHER_CTX_free(ctx->sw_ctx);
-        ctx->sw_ctx = NULL;
-    }
 
     if (iv != NULL) {
         if (ivlen == 0 || ivlen > EVP_MAX_IV_LENGTH) {
@@ -1619,6 +1656,7 @@ static int afalg_gcm_append_saved_ct(AFALG_GCM_CTX *ctx,
                                      size_t inl)
 {
     size_t total;
+    size_t new_cap;
     uint8_t *nb;
 
     if (inl == 0)
@@ -1628,11 +1666,19 @@ static int afalg_gcm_append_saved_ct(AFALG_GCM_CTX *ctx,
 
     total = ctx->saved_ct_len + inl;
     if (total > ctx->saved_ct_cap) {
-        nb = OPENSSL_realloc(ctx->saved_ct, total);
+        new_cap = ctx->saved_ct_cap ? ctx->saved_ct_cap : total;
+        while (new_cap < total) {
+            if (new_cap > SIZE_MAX / 2U) {
+                new_cap = total;
+                break;
+            }
+            new_cap *= 2U;
+        }
+        nb = OPENSSL_realloc(ctx->saved_ct, new_cap);
         if (nb == NULL)
             return 0;
         ctx->saved_ct = nb;
-        ctx->saved_ct_cap = total;
+        ctx->saved_ct_cap = new_cap;
     }
 
     memcpy(ctx->saved_ct + ctx->saved_ct_len, in, inl);
@@ -1652,16 +1698,24 @@ static int afalg_gcm_update(void *vctx,
 
     if (out == NULL) {
         if (inl > 0) {
+            size_t total_aad;
             size_t new_cap;
             uint8_t *nb;
 
-            /* Reject AAD passed after payload data has already started */
             if (in == NULL || ctx->used_hw_stream || ctx->saved_ct_len > 0 ||
                 ctx->aad_len > SIZE_MAX - inl)
                 return 0;
 
-            new_cap = ctx->aad_len + inl;
-            if (new_cap > ctx->aad_cap) {
+            total_aad = ctx->aad_len + inl;
+            if (total_aad > ctx->aad_cap) {
+                new_cap = ctx->aad_cap ? ctx->aad_cap : total_aad;
+                while (new_cap < total_aad) {
+                    if (new_cap > SIZE_MAX / 2U) {
+                        new_cap = total_aad;
+                        break;
+                    }
+                    new_cap *= 2U;
+                }
                 nb = OPENSSL_realloc(ctx->aad_buf, new_cap);
                 if (nb == NULL)
                     return 0;
@@ -1669,9 +1723,9 @@ static int afalg_gcm_update(void *vctx,
                 ctx->aad_cap = new_cap;
             }
             memcpy(ctx->aad_buf + ctx->aad_len, in, inl);
-            ctx->aad_len += inl;
+            ctx->aad_len = total_aad;
         }
-        if (ctx->sw_ctx != NULL) {
+        if (ctx->sw_ctx != NULL && ctx->sw_inited) {
             if (!afalg_gcm_feed_sw(ctx->sw_ctx, NULL, NULL, in, inl))
                 return 0;
         }
@@ -1692,20 +1746,9 @@ static int afalg_gcm_update(void *vctx,
         return 0;
     }
 
-    /*
-     * AF_ALG aead oneshot cannot export mid-stream GHASH/counter state.
-     * Multi-update GCM encryption is supported when starting with small
-     * chunks (< AFALG_GCM_MIN_HW_BYTES, routed to SW), whereas HW oneshot
-     * expects a single payload Update (or one-shot EVP_Cipher).
-     */
     if (ctx->used_hw_stream)
         return 0;
 
-    /*
-     * For non-TLS decrypt, always buffer ciphertext until Final (even if the
-     * tag was set before Update) so multi-chunk decrypt works and plaintext
-     * is never exposed before tag verification.
-     */
     if (!ctx->enc && ctx->tls_aad_len == (size_t)-1) {
         if (!afalg_gcm_append_saved_ct(ctx, in, inl))
             return 0;
@@ -1723,9 +1766,8 @@ static int afalg_gcm_update(void *vctx,
     if (!afalg_gcm_ensure_hw(ctx))
         return afalg_gcm_sw_update(ctx, out, outl, outsize, in, inl);
 
-    /* Use a scratch output buffer when in == out so a partial readv cannot corrupt input */
-    if (in == out) {
-        uint8_t *scratch = OPENSSL_malloc(inl);
+    if (in == out || !ctx->enc) {
+        uint8_t *scratch = afalg_gcm_get_scratch(ctx, inl);
 
         if (scratch == NULL)
             return afalg_gcm_sw_update(ctx, out, outl, outsize, in, inl);
@@ -1733,13 +1775,13 @@ static int afalg_gcm_update(void *vctx,
         hw_rc = afalg_gcm_hw_oneshot(ctx, scratch, in, inl);
         if (hw_rc == 1) {
             memcpy(out, scratch, inl);
-            OPENSSL_clear_free(scratch, inl);
             ctx->used_hw_stream = 1;
             *outl = inl;
             return 1;
         }
 
-        OPENSSL_clear_free(scratch, inl);
+        if (!ctx->enc)
+            OPENSSL_cleanse(scratch, inl);
         afalg_gcm_reset_hw(ctx);
         if (hw_rc < 0)
             return 0;
@@ -1791,23 +1833,26 @@ static int afalg_gcm_final(void *vctx,
             afalg_gcm_fits_hw_payload(ctx, ct_len) &&
             ctx->iv_len == GCM_IV_SZ &&
             afalg_gcm_ensure_hw(ctx)) {
-            hw_rc = afalg_gcm_hw_oneshot(ctx, out, ctx->saved_ct, ct_len);
-            if (hw_rc == 1) {
-                OPENSSL_cleanse(ctx->saved_ct, ct_len);
-                ctx->saved_ct_len = 0;
-                ctx->used_hw_stream = 1;
-                *outl = ct_len;
-                return 1;
-            }
-            afalg_gcm_reset_hw(ctx);
-            if (hw_rc < 0) {
-                OPENSSL_cleanse(ctx->saved_ct, ct_len);
-                ctx->saved_ct_len = 0;
-                return 0;
+            uint8_t *scratch = afalg_gcm_get_scratch(ctx, ct_len);
+
+            if (scratch != NULL) {
+                hw_rc = afalg_gcm_hw_oneshot(ctx, scratch, ctx->saved_ct, ct_len);
+                if (hw_rc == 1) {
+                    memcpy(out, scratch, ct_len);
+                    ctx->saved_ct_len = 0;
+                    ctx->used_hw_stream = 1;
+                    *outl = ct_len;
+                    return 1;
+                }
+                OPENSSL_cleanse(scratch, ct_len);
+                afalg_gcm_reset_hw(ctx);
+                if (hw_rc < 0) {
+                    ctx->saved_ct_len = 0;
+                    return 0;
+                }
             }
         }
 
-        /* Decrypt in-place inside saved_ct first so plaintext never leaks on tag fail */
         if (!afalg_gcm_ensure_sw(ctx))
             return 0;
         if (!afalg_gcm_feed_sw(ctx->sw_ctx, ctx->saved_ct, &sw_pt_len,
@@ -1844,7 +1889,7 @@ static int afalg_gcm_final(void *vctx,
         return 1;
     }
 
-    if (ctx->force_sw || ctx->sw_ctx != NULL) {
+    if (ctx->force_sw || (ctx->sw_ctx != NULL && ctx->sw_inited)) {
         if (!ctx->enc && !ctx->tag_set && ctx->tls_aad_len == (size_t)-1)
             return 0;
         if (!afalg_gcm_ensure_sw(ctx))
@@ -1867,7 +1912,6 @@ static int afalg_gcm_final(void *vctx,
     }
 
     if (!ctx->enc) {
-        /* 0-byte decrypt: must still verify tag against AAD in SW */
         if (!ctx->tag_set)
             return 0;
         if (!ctx->used_hw_stream) {
@@ -1886,7 +1930,6 @@ static int afalg_gcm_final(void *vctx,
     }
 
     if (!ctx->tag_set) {
-        /* Empty-payload GCM encrypt always runs in SW */
         if (!afalg_gcm_ensure_sw(ctx))
             return 0;
         if (!afalg_gcm_sw_final_call(ctx->sw_ctx, out, outsize, &fin_outl))
@@ -1907,10 +1950,46 @@ static int afalg_gcm_cipher(void *vctx,
                             unsigned char *out, size_t *outl, size_t outsize,
                             const unsigned char *in, size_t inl)
 {
+    AFALG_GCM_CTX *ctx = (AFALG_GCM_CTX *)vctx;
     size_t upd_outl = 0;
     size_t fin_outl = 0;
     size_t rem_outsize;
     unsigned char *fin_out;
+
+    if (ctx == NULL || outl == NULL)
+        return 0;
+
+    if (!ctx->enc &&
+        ctx->key_set &&
+        ctx->iv_set &&
+        ctx->tag_set &&
+        out != NULL &&
+        in != NULL &&
+        inl >= AFALG_GCM_MIN_HW_BYTES &&
+        outsize >= inl &&
+        ctx->saved_ct_len == 0 &&
+        !ctx->force_sw &&
+        !ctx->used_hw_stream &&
+        ctx->tls_aad_len == (size_t)-1 &&
+        ctx->iv_len == GCM_IV_SZ &&
+        afalg_gcm_fits_hw_payload(ctx, inl) &&
+        afalg_gcm_ensure_hw(ctx)) {
+        uint8_t *scratch = afalg_gcm_get_scratch(ctx, inl);
+
+        if (scratch != NULL) {
+            int hw_rc = afalg_gcm_hw_oneshot(ctx, scratch, in, inl);
+            if (hw_rc == 1) {
+                memcpy(out, scratch, inl);
+                ctx->used_hw_stream = 1;
+                *outl = inl;
+                return 1;
+            }
+            OPENSSL_cleanse(scratch, inl);
+            afalg_gcm_reset_hw(ctx);
+            if (hw_rc < 0)
+                return 0;
+        }
+    }
 
     if (!afalg_gcm_update(vctx, out, &upd_outl, outsize, in, inl))
         return 0;
@@ -2049,11 +2128,8 @@ static int afalg_gcm_set_ctx_params(void *vctx, const OSSL_PARAM params[])
         if (ivlen != ctx->iv_len) {
             ctx->iv_len = ivlen;
             ctx->used_hw_stream = 0;
+            ctx->sw_inited = 0;
             afalg_gcm_reset_hw(ctx);
-            if (ctx->sw_ctx != NULL) {
-                EVP_CIPHER_CTX_free(ctx->sw_ctx);
-                ctx->sw_ctx = NULL;
-            }
         }
     }
 
@@ -2066,11 +2142,8 @@ static int afalg_gcm_set_ctx_params(void *vctx, const OSSL_PARAM params[])
             return 0;
         if (taglen != ctx->tag_len) {
             ctx->tag_len = taglen;
+            ctx->sw_inited = 0;
             afalg_gcm_reset_hw(ctx);
-            if (ctx->sw_ctx != NULL) {
-                EVP_CIPHER_CTX_free(ctx->sw_ctx);
-                ctx->sw_ctx = NULL;
-            }
         }
     }
 
@@ -2092,7 +2165,7 @@ static int afalg_gcm_set_ctx_params(void *vctx, const OSSL_PARAM params[])
             memcpy(ctx->tag, tag_ptr, tag_len);
             ctx->tag_set = 1;
         }
-        if (ctx->sw_ctx != NULL && !ctx->enc && tag_ptr != NULL) {
+        if (ctx->sw_ctx != NULL && ctx->sw_inited && !ctx->enc && tag_ptr != NULL) {
             if (!EVP_CIPHER_CTX_ctrl(ctx->sw_ctx, EVP_CTRL_AEAD_SET_TAG,
                                      (int)tag_len, (void *)tag_ptr))
                 return 0;
