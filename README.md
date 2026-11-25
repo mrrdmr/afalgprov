@@ -1,6 +1,6 @@
 # afalgprov — OpenSSL 3.5 AF_ALG Provider for NXP LS1024A
 
-Hardware-accelerated **OpenSSL 3.5+** provider built on the Linux `AF_ALG` socket interface for **NXP QorIQ LS1024A (Comcerto 2000, Dual ARMv7 Cortex-A9)**. It offloads symmetric and authenticated encryption to the **Elliptic SPACC** DMA crypto engine and **ARMv7 NEON `ghash-ce`** accelerator.
+Hardware-accelerated **OpenSSL 3.5+** provider built on the Linux `AF_ALG` socket interface for **NXP QorIQ LS1024A (Comcerto 2000, Dual ARMv7 Cortex-A9)** on Linux kernel [`symops/MCG1-6.18`](https://github.com/symops/MCG1-6.18) ([PR #13](https://github.com/symops/MCG1-6.18/pull/13)). It offloads symmetric and authenticated encryption to the **Elliptic SPACC** DMA crypto engine and **ARMv7 NEON `ghash-ce`** accelerator.
 ## Supported Algorithms
 
 * **AES-128-CTR / AES-192-CTR / AES-256-CTR** (`skcipher` -> `ctr-aes-ls1024a-spacc`, SPACC DMA)
