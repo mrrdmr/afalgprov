@@ -64,18 +64,39 @@ Providers:
 
 ## Benchmarks
 
-Measured on **NXP LS1024A (Dual ARMv7 Cortex-A9 @ 1.2 GHz)** as unprivileged user `nobody` under default kernel buffer limits (`net.core.wmem_max = 212992`, `net.core.rmem_max = 212992`) with **128 KiB (`131072` bytes)** blocks:
+Measured on **NXP LS1024A (Dual ARMv7 Cortex-A9)** under default kernel buffer limits (`net.core.wmem_max = 212992`, `net.core.rmem_max = 212992`) with **64 KiB (`65536` bytes)** blocks (`openssl speed -elapsed`, `~3.07s–3.11s` wall time):
 
-| Algorithm & Mode | Threads | Provider | Throughput | `user` + `sys` (3.07s) | Total CPU Load (2 Cores) |
+### CTR Throughput and CPU Usage (64 KiB)
+
+| Algorithm | Threads | Provider | Throughput | `user` + `sys` | Gain vs Pure CPU |
 | :--- | :---: | :--- | :---: | :---: | :---: |
-| **AES-256-GCM Encrypt** | 1T | `afalgprov` | **30.47 MB/s** (`30466.57k`) | `0.07s + 0.36s` | **7.0%** (0.14 core) |
-| **AES-256-GCM Encrypt** | 4T | `afalgprov` | **32.66 MB/s** (`32664.11k`) | `0.11s + 0.63s` | **11.9%** (0.24 core) |
-| **AES-256-GCM Decrypt** | 1T | `afalgprov` | **29.63 MB/s** (`29633.67k`) | `0.11s + 1.91s` | **32.9%** (0.66 core) |
-| **AES-256-GCM Decrypt** | 4T | `afalgprov` | **49.28 MB/s** (`49275.02k`) | `0.20s + 3.85s` | **64.9%** (1.30 cores) |
-| **AES-256-CTR Encrypt** | 1T | `afalgprov` | **44.52 MB/s** (`44520.79k`) | `0.06s + 0.79s` | **13.8%** (0.28 core) |
-| **AES-256-GCM Encrypt** | 1T | `default` (SW baseline) | **11.02 MB/s** (`11017.02k`) | `3.04s + 0.02s` | **49.8%** (1.00 core) |
+| **AES-128-CTR** | 1T | `default` (Pure CPU) | **29.03 MB/s** (`29032.45k`) | `3.04s + 0.03s` | — |
+| **AES-192-CTR** | 1T | `default` (Pure CPU) | **24.58 MB/s** (`24576.00k`) | `3.04s + 0.02s` | — |
+| **AES-256-CTR** | 1T | `default` (Pure CPU) | **21.30 MB/s** (`21299.20k`) | `3.04s + 0.02s` | — |
+| **AES-128-CTR** | 1T | `afalgprov` (SPACC) | **41.94 MB/s** (`41943.04k`) | `0.07s + 0.73s` | **+44.5%** (`1.44x`) |
+| **AES-192-CTR** | 1T | `afalgprov` (SPACC) | **41.75 MB/s** (`41746.43k`) | `0.06s + 0.76s` | **+69.9%** (`1.70x`) |
+| **AES-256-CTR** | 1T | `afalgprov` (SPACC) | **41.62 MB/s** (`41615.36k`) | `0.05s + 0.78s` | **+95.4%** (`1.95x`) |
+| **AES-128-CTR** | 2T | `afalgprov` (SPACC) | **58.37 MB/s** (`58370.73k`) | `0.10s + 1.65s` | **+2.0%** vs 2T CPU (`57.23k`) |
+| **AES-192-CTR** | 2T | `afalgprov` (SPACC) | **58.84 MB/s** (`58840.88k`) | `0.08s + 1.62s` | **+21.7%** vs 2T CPU (`48.34k`) |
+| **AES-256-CTR** | 2T | `afalgprov` (SPACC) | **58.73 MB/s** (`58731.00k`) | `0.11s + 1.58s` | **+40.0%** vs 2T CPU (`41.94k`) |
+| **AES-128-CTR** | 4T | `afalgprov` (SPACC) | **64.50 MB/s** (`64495.75k`) | `0.20s + 2.42s` | **+16.4%** vs 4T CPU (`55.41k`) |
+| **AES-192-CTR** | 4T | `afalgprov` (SPACC) | **64.51 MB/s** (`64506.27k`) | `0.20s + 2.37s` | **+37.2%** vs 4T CPU (`47.03k`) |
+| **AES-256-CTR** | 4T | `afalgprov` (SPACC) | **64.29 MB/s** (`64288.68k`) | `0.18s + 2.44s` | **+57.5%** vs 4T CPU (`40.83k`) |
+
+### GCM & AEAD Throughput (64 KiB)
+
+| Algorithm & Mode | Threads | Provider | Throughput | `user` + `sys` / Notes |
+| :--- | :---: | :--- | :---: | :--- |
+| **AES-128-GCM** | 1T | `default` (Pure CPU) | **12.87 MB/s** (`12866.90k`) | `3.04s + 0.02s` |
+| **AES-192-GCM** | 1T | `default` (Pure CPU) | **11.91 MB/s** (`11905.71k`) | `3.04s + 0.02s` |
+| **AES-256-GCM** | 1T | `default` (Pure CPU) | **11.08 MB/s** (`11075.58k`) | `3.04s + 0.02s` |
+| **AES-128-GCM** | 1T | `afalgprov` (SPACC) | **26.63 MB/s** (`26629.46k`) | `0.08s + 0.39s` (**+107.0%**, `2.07x`) |
+| **AES-192-GCM** | 1T | `afalgprov` (SPACC) | **26.59 MB/s** (`26585.77k`) | `0.05s + 0.40s` (**+123.3%**, `2.23x`) |
+| **AES-256-GCM** | 1T | `afalgprov` (SPACC) | **26.43 MB/s** (`26432.85k`) | `0.10s + 0.39s` (**+138.7%**, `2.39x`) |
+| **AES-128-GCM (deferred=1)** | 1T | `afalgprov` (SPACC) | **18.68 MB/s** | `6.690s` for `2000 x 64 KiB` (`+11.1%` vs `16.82 MB/s` baseline) |
+| **ChaCha20-Poly1305** | 1T | `default` (Pure CPU) | **61.73 MB/s** (`61734.91k`) | `2826 ops / 3.00s` (SW reference) |
 
 ### Summary
 
-* **Single-thread `AES-256-GCM` Encrypt:** **2.77x** higher throughput with **7.1x** lower CPU utilization compared to the software baseline.
-* **Multi-thread `AES-256-GCM` Decrypt (4T):** Reaches **49.28 MB/s** running unprivileged under stock kernel limits.
+* **Single-thread `AES-128/192/256-GCM`:** **2.07x–2.39x** faster than pure CPU (`26.43–26.63 MB/s` vs `11.08–12.87 MB/s`) with ~**6.5x** lower `user + sys` CPU time.
+* **Multi-thread `AES-CTR` Scaling:** Scales from **~41.6–41.9 MB/s** (`1T`) to **~58.4–58.8 MB/s** (`2T`) and **~64.3–64.5 MB/s** (`4T`), with matching IRQ 45 (`9b000000.crypto`) activity on SPACC.
