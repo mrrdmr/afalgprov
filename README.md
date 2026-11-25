@@ -93,7 +93,6 @@ Measured on **NXP LS1024A (Dual ARMv7 Cortex-A9)** under default kernel buffer l
 | **AES-128-GCM** | 1T | `afalgprov` (SPACC) | **26.63 MB/s** (`26629.46k`) | `0.08s + 0.39s` (**+107.0%**, `2.07x`) |
 | **AES-192-GCM** | 1T | `afalgprov` (SPACC) | **26.59 MB/s** (`26585.77k`) | `0.05s + 0.40s` (**+123.3%**, `2.23x`) |
 | **AES-256-GCM** | 1T | `afalgprov` (SPACC) | **26.43 MB/s** (`26432.85k`) | `0.10s + 0.39s` (**+138.7%**, `2.39x`) |
-| **AES-128-GCM (deferred=1)** | 1T | `afalgprov` (SPACC) | **18.68 MB/s** | `6.690s` for `2000 x 64 KiB` (`+11.1%` vs `16.82 MB/s` baseline) |
 | **ChaCha20-Poly1305** | 1T | `default` (Pure CPU) | **61.73 MB/s** (`61734.91k`) | `2826 ops / 3.00s` (SW reference) |
 
 ### Summary
