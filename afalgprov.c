@@ -1061,7 +1061,9 @@ typedef struct {
     uint8_t *aad_sink;
     size_t aad_sink_cap;
 
-    /* Deferred ciphertext buffer when decrypting before tag is set */
+    /* Deferred ciphertext pointer/buffer when decrypting before tag is set */
+    const uint8_t *dec_ptr;
+    int dec_owned;
     uint8_t *dec_buf;
     size_t dec_len;
     size_t dec_cap;
@@ -1142,6 +1144,15 @@ static int afalg_gcm_reserve_buf(uint8_t **buf, size_t *cap, size_t need)
     *buf = nb;
     *cap = new_cap;
     return 1;
+}
+
+static void afalg_gcm_clear_deferred(AFALG_GCM_CTX *ctx, size_t len)
+{
+    if (ctx->dec_owned && ctx->dec_buf != NULL && len > 0)
+        OPENSSL_cleanse(ctx->dec_buf, len);
+    ctx->dec_ptr = NULL;
+    ctx->dec_owned = 0;
+    ctx->dec_len = 0;
 }
 
 static void afalg_gcm_reset_hw(AFALG_GCM_CTX *ctx)
@@ -1556,10 +1567,15 @@ static void afalg_gcm_freectx(void *vctx)
         OPENSSL_free(ctx->aad_buf);
     if (ctx->aad_sink != NULL)
         OPENSSL_free(ctx->aad_sink);
-    if (ctx->dec_buf != NULL)
-        OPENSSL_clear_free(ctx->dec_buf, ctx->dec_cap);
+    if (ctx->dec_buf != NULL) {
+        if (ctx->dec_owned && ctx->dec_len > 0)
+            OPENSSL_cleanse(ctx->dec_buf, ctx->dec_len);
+        OPENSSL_free(ctx->dec_buf);
+    }
+    if (ctx->stage_buf != NULL && ctx->stage_cap > 0)
+        OPENSSL_cleanse(ctx->stage_buf, ctx->stage_cap);
     if (ctx->stage_buf != NULL)
-        OPENSSL_clear_free(ctx->stage_buf, ctx->stage_cap);
+        OPENSSL_free(ctx->stage_buf);
 
     OPENSSL_cleanse(ctx->key, sizeof(ctx->key));
     OPENSSL_cleanse(ctx->iv, sizeof(ctx->iv));
@@ -1626,14 +1642,19 @@ static void *afalg_gcm_dupctx(void *vctx)
     }
 
     if (src->dec_len > 0) {
-        dst->dec_buf = OPENSSL_malloc(src->dec_len);
-        if (dst->dec_buf == NULL) {
-            afalg_gcm_freectx(dst);
-            return NULL;
+        const uint8_t *src_ct = src->dec_owned ? src->dec_buf : src->dec_ptr;
+        if (src_ct != NULL) {
+            dst->dec_buf = OPENSSL_malloc(src->dec_len);
+            if (dst->dec_buf == NULL) {
+                afalg_gcm_freectx(dst);
+                return NULL;
+            }
+            memcpy(dst->dec_buf, src_ct, src->dec_len);
+            dst->dec_cap = src->dec_len;
+            dst->dec_len = src->dec_len;
+            dst->dec_owned = 1;
+            dst->dec_ptr = NULL;
         }
-        memcpy(dst->dec_buf, src->dec_buf, src->dec_len);
-        dst->dec_cap = src->dec_len;
-        dst->dec_len = src->dec_len;
     }
 
     if (src->sw_cipher != NULL) {
@@ -1673,6 +1694,8 @@ static int afalg_gcm_init_common(void *vctx,
     ctx->tag_set = 0;
     ctx->tag_len = GCM_TAG_SZ;
     ctx->aad_len = 0;
+    ctx->dec_ptr = NULL;
+    ctx->dec_owned = 0;
     ctx->dec_len = 0;
     ctx->sw_inited = 0;
     ctx->force_sw = 0;
@@ -1777,13 +1800,33 @@ static int afalg_gcm_update(void *vctx,
         return 0;
     }
 
-    /* When decrypting before SET_TAG is called, buffer ciphertext without
-     * touching caller's out buffer until tag verification succeeds in final(). */
+    /* When decrypting before SET_TAG is called, avoid copying on a single
+     * DecryptUpdate by keeping a pointer to `in`; promote to `dec_buf` only if
+     * additional chunks arrive before final(). */
     if (!ctx->enc && !ctx->tag_set && ctx->tls_aad_len == (size_t)-1) {
         if (ctx->dec_len > SIZE_MAX - inl)
             return 0;
-        if (!afalg_gcm_reserve_buf(&ctx->dec_buf, &ctx->dec_cap, ctx->dec_len + inl))
-            return 0;
+
+        if (ctx->dec_len == 0) {
+            ctx->dec_ptr = in;
+            ctx->dec_owned = 0;
+            ctx->dec_len = inl;
+            *outl = 0;
+            return 1;
+        }
+
+        if (!ctx->dec_owned) {
+            if (!afalg_gcm_reserve_buf(&ctx->dec_buf, &ctx->dec_cap, ctx->dec_len + inl))
+                return 0;
+            if (ctx->dec_ptr != NULL && ctx->dec_len > 0)
+                memcpy(ctx->dec_buf, ctx->dec_ptr, ctx->dec_len);
+            ctx->dec_owned = 1;
+            ctx->dec_ptr = NULL;
+        } else {
+            if (!afalg_gcm_reserve_buf(&ctx->dec_buf, &ctx->dec_cap, ctx->dec_len + inl))
+                return 0;
+        }
+
         memcpy(ctx->dec_buf + ctx->dec_len, in, inl);
         ctx->dec_len += inl;
         *outl = 0;
@@ -1819,18 +1862,19 @@ static int afalg_gcm_verify_and_decrypt_deferred(AFALG_GCM_CTX *ctx,
                                                  size_t outsize)
 {
     size_t ct_len = ctx->dec_len;
+    const uint8_t *src_ct = ctx->dec_owned ? ctx->dec_buf : ctx->dec_ptr;
     size_t sw_upd_len = 0;
     size_t sw_fin_len = 0;
 
     (void)outsize;
 
     if (ct_len == 0) {
-        ctx->dec_len = 0;
+        afalg_gcm_clear_deferred(ctx, 0);
         *outl = 0;
         return 1;
     }
 
-    if (out == NULL)
+    if (out == NULL || src_ct == NULL)
         return 0;
 
     if (!afalg_gcm_reserve_buf(&ctx->stage_buf, &ctx->stage_cap, ct_len))
@@ -1841,20 +1885,17 @@ static int afalg_gcm_verify_and_decrypt_deferred(AFALG_GCM_CTX *ctx,
         ct_len >= ctx->min_hw_bytes &&
         afalg_gcm_fits_hw_payload(ctx, ct_len) &&
         afalg_gcm_ensure_hw(ctx)) {
-        int hw_rc = afalg_gcm_hw_oneshot(ctx, ctx->stage_buf, ctx->dec_buf, ct_len);
+        int hw_rc = afalg_gcm_hw_oneshot(ctx, ctx->stage_buf, src_ct, ct_len);
         if (hw_rc == 1) {
             memcpy(out, ctx->stage_buf, ct_len);
-            OPENSSL_cleanse(ctx->stage_buf, ct_len);
-            OPENSSL_cleanse(ctx->dec_buf, ct_len);
-            ctx->dec_len = 0;
+            afalg_gcm_clear_deferred(ctx, ct_len);
             *outl = ct_len;
             return 1;
         }
         if (hw_rc < 0) {
             /* Bad tag: leave caller `out` untouched */
             OPENSSL_cleanse(ctx->stage_buf, ct_len);
-            OPENSSL_cleanse(ctx->dec_buf, ct_len);
-            ctx->dec_len = 0;
+            afalg_gcm_clear_deferred(ctx, ct_len);
             return 0;
         }
         afalg_gcm_reset_hw(ctx);
@@ -1866,7 +1907,7 @@ static int afalg_gcm_verify_and_decrypt_deferred(AFALG_GCM_CTX *ctx,
     }
 
     if (!afalg_gcm_feed_sw(ctx->sw_ctx, ctx->stage_buf, (int *)&sw_upd_len,
-                           ctx->dec_buf, ct_len)) {
+                           src_ct, ct_len)) {
         OPENSSL_cleanse(ctx->stage_buf, ct_len);
         return 0;
     }
@@ -1881,15 +1922,12 @@ static int afalg_gcm_verify_and_decrypt_deferred(AFALG_GCM_CTX *ctx,
                                  ct_len - sw_upd_len, &sw_fin_len)) {
         /* Bad tag: leave caller `out` untouched */
         OPENSSL_cleanse(ctx->stage_buf, ct_len);
-        OPENSSL_cleanse(ctx->dec_buf, ct_len);
-        ctx->dec_len = 0;
+        afalg_gcm_clear_deferred(ctx, ct_len);
         return 0;
     }
 
     memcpy(out, ctx->stage_buf, sw_upd_len + sw_fin_len);
-    OPENSSL_cleanse(ctx->stage_buf, ct_len);
-    OPENSSL_cleanse(ctx->dec_buf, ct_len);
-    ctx->dec_len = 0;
+    afalg_gcm_clear_deferred(ctx, ct_len);
     *outl = sw_upd_len + sw_fin_len;
     return 1;
 }
@@ -1934,7 +1972,7 @@ static int afalg_gcm_final(void *vctx,
     if (!ctx->enc) {
         if (!ctx->tag_set)
             return 0;
-        ctx->dec_len = 0;
+        afalg_gcm_clear_deferred(ctx, 0);
         *outl = 0;
         return 1;
     }
